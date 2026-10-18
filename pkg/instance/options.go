@@ -14,6 +14,8 @@ import (
 
 // Options contains the actual configuration (exported - this is the public API).
 type Options struct {
+	// Controlled opts into atomic use/maintenance admission; absent/false is legacy.
+	Controlled bool `json:"controlled,omitempty"`
 	// Auto restart
 	AutoRestart  *bool `json:"auto_restart,omitempty"`
 	MaxRestarts  *int  `json:"max_restarts,omitempty"`
@@ -116,6 +118,13 @@ func (o *options) UnmarshalJSON(data []byte) error {
 
 // UnmarshalJSON implements custom JSON unmarshaling for Options
 func (c *Options) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if value, ok := fields["controlled"]; ok && string(value) == "null" {
+		return fmt.Errorf("controlled must be a boolean, not null")
+	}
 	// Use anonymous struct to avoid recursion
 	type Alias Options
 	aux := &struct {

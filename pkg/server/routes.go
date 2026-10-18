@@ -50,6 +50,8 @@ func SetupRouter(handler *Handler) *chi.Mux {
 		}
 
 		r.Get("/version", handler.VersionHandler())
+		r.Get("/resource-policy", handler.ResourcePolicy())
+		r.Put("/resource-policy", handler.ResourcePolicy())
 
 		r.Get("/config", handler.ConfigHandler())
 

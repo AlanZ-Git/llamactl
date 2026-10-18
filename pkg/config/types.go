@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"llamactl/pkg/resourcepolicy"
+	"time"
+)
 
 // BackendSettings contains structured backend configuration
 type BackendSettings struct {
@@ -33,13 +36,15 @@ type BackendConfig struct {
 
 // AppConfig represents the configuration for llamactl
 type AppConfig struct {
-	Server    ServerConfig          `yaml:"server" json:"server"`
-	Backends  BackendConfig         `yaml:"backends" json:"backends"`
-	Instances InstancesConfig       `yaml:"instances" json:"instances"`
-	Database  DatabaseConfig        `yaml:"database" json:"database"`
-	Auth      AuthConfig            `yaml:"auth" json:"auth"`
-	LocalNode string                `yaml:"local_node,omitempty" json:"local_node,omitempty"`
-	Nodes     map[string]NodeConfig `yaml:"nodes,omitempty" json:"nodes,omitempty"`
+	// ResourcePolicy is initialized by manager.New before loading instances.
+	ResourcePolicy *resourcepolicy.Gate  `yaml:"-" json:"-" swaggerignore:"true"`
+	Server         ServerConfig          `yaml:"server" json:"server"`
+	Backends       BackendConfig         `yaml:"backends" json:"backends"`
+	Instances      InstancesConfig       `yaml:"instances" json:"instances"`
+	Database       DatabaseConfig        `yaml:"database" json:"database"`
+	Auth           AuthConfig            `yaml:"auth" json:"auth"`
+	LocalNode      string                `yaml:"local_node,omitempty" json:"local_node,omitempty"`
+	Nodes          map[string]NodeConfig `yaml:"nodes,omitempty" json:"nodes,omitempty"`
 
 	// Directory where all llamactl data will be stored (database, instances, logs, etc.)
 	DataDir string `yaml:"data_dir" json:"data_dir"`

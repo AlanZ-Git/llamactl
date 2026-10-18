@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"llamactl/pkg/resourcepolicy"
 	"log"
 	"net"
 	"net/http"
@@ -39,6 +40,18 @@ func newProcess(instance *Instance) *process {
 
 // start starts the OS process and returns an error if it fails.
 func (p *process) start() error {
+	permit, err := p.instance.policy.Acquire()
+	if err != nil {
+		return err
+	}
+	defer permit.Close()
+	return p.startPermit(permit)
+}
+
+func (p *process) startPermit(permit *resourcepolicy.Permit) error {
+	if err := permit.Check(); err != nil {
+		return err
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -57,10 +70,16 @@ func (p *process) start() error {
 	if err != nil {
 		return fmt.Errorf("prepare start options: %w", err)
 	}
+	if err := candidate.ValidateControlled(p.instance.appConfig()); err != nil {
+		return fmt.Errorf("prepare start controlled mode: %w", err)
+	}
 	if err := candidate.ValidateEnvironmentPolicy(p.instance.appConfig()); err != nil {
 		return fmt.Errorf("prepare start environment: %w", err)
 	}
-	if err := syncPresetIni(p.instance.Name, candidate, p.instance.globalInstanceSettings.InstancesDir); err != nil {
+	if err := permit.Check(); err != nil {
+		return err
+	}
+	if err := syncPresetIniAdmitted(p.instance.Name, candidate, p.instance.globalInstanceSettings.InstancesDir, permit); err != nil {
 		return fmt.Errorf("prepare start preset: %w", err)
 	}
 
@@ -152,6 +171,9 @@ func (p *process) start() error {
 	}
 	startupPipes = append(startupPipes, p.stderr, p.cmd.Stderr.(io.Closer))
 
+	if err := permit.Check(); err != nil {
+		return err
+	}
 	if err := p.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start instance %s: %w", p.instance.Name, err)
 	}
@@ -273,12 +295,12 @@ func (p *process) stop() error {
 }
 
 // restart manually restarts the process (resets restart counter)
-func (p *process) restart() error {
-	prepared, err := p.instance.PrepareOptions(p.instance.GetOptions())
+func (p *process) restart(lease *Maintenance) error {
+	prepared, err := lease.prepareOptions(p.instance.GetOptions())
 	if err != nil {
 		return fmt.Errorf("prepare restart: %w", err)
 	}
-	defer prepared.Close()
+	defer prepared.preset.cleanup()
 	// Stop the process first
 	if err := p.stop(); err != nil {
 		// If it's not running, that's ok - we'll just start it
@@ -287,7 +309,7 @@ func (p *process) restart() error {
 		}
 	}
 
-	if err := prepared.Commit(); err != nil {
+	if err := prepared.commit(); err != nil {
 		return fmt.Errorf("commit restart (instance stopped): %w", err)
 	}
 	// Reset restart counter for manual restart
@@ -296,7 +318,7 @@ func (p *process) restart() error {
 	p.mu.Unlock()
 
 	// Start the process
-	return p.start()
+	return p.startPermit(lease.permit)
 }
 
 // waitForHealthy waits for the process to become healthy
@@ -438,7 +460,7 @@ func (p *process) shouldAutoRestart() bool {
 		return false
 	}
 
-	if opts.AutoRestart == nil || !*opts.AutoRestart {
+	if opts.Controlled || opts.AutoRestart == nil || !*opts.AutoRestart {
 		log.Printf("Instance %s not restarting: AutoRestart is disabled", p.instance.Name)
 		return false
 	}
@@ -466,6 +488,14 @@ func (p *process) handleAutoRestart(err error) {
 		return
 	}
 
+	// Reserve before the delay, so pause/resume cannot revive a queued restart.
+	lease, admitErr := p.instance.BeginWorkMaintenance()
+	if admitErr != nil {
+		p.instance.SetStatus(Stopped)
+		p.mu.Unlock()
+		return
+	}
+	defer lease.Close()
 	// Get restart parameters
 	opts := p.instance.GetOptions()
 	if opts.RestartDelay == nil {
@@ -493,9 +523,13 @@ func (p *process) handleAutoRestart(err error) {
 	// Release the lock before sleeping
 	p.mu.Unlock()
 
+	p.waitAutomaticRestart(restartCtx, time.After(time.Duration(restartDelay)*time.Second), lease)
+}
+
+func (p *process) waitAutomaticRestart(restartCtx context.Context, timer <-chan time.Time, lease *Maintenance) {
 	// Use context-aware sleep so it can be cancelled
 	select {
-	case <-time.After(time.Duration(restartDelay) * time.Second):
+	case <-timer:
 		// Sleep completed normally, continue with restart
 	case <-restartCtx.Done():
 		// Restart was cancelled
@@ -504,7 +538,10 @@ func (p *process) handleAutoRestart(err error) {
 	}
 
 	// Restart the instance
-	if err := p.start(); err != nil {
+	if p.instance.IsControlled() {
+		return
+	}
+	if err := lease.Start(); err != nil {
 		log.Printf("Failed to restart instance %s: %v", p.instance.Name, err)
 	} else {
 		log.Printf("Successfully restarted instance %s", p.instance.Name)

@@ -61,7 +61,7 @@ func (h *Handler) LlamaCppUIProxy() http.HandlerFunc {
 			return
 		}
 
-		if !inst.IsRemote() && !inst.IsRunning() {
+		if !inst.IsControlled() && !inst.IsRemote() && !inst.IsRunning() {
 			writeError(w, http.StatusBadRequest, "instance is not running", "Instance is not running")
 			return
 		}
@@ -116,21 +116,24 @@ func (h *Handler) LlamaCppProxy() http.HandlerFunc {
 			return
 		}
 
-		// Check if instance is shutting down before autostart logic
-		if inst.GetStatus() == instance.ShuttingDown {
+		if !inst.IsRemote() {
+			h.stripLlamaCppPrefix(r, inst.Name)
+		}
+		release, err := inst.ReserveProxyRequest(w, r)
+		if err != nil {
+			return
+		}
+		defer release()
+		if !inst.IsControlled() && inst.GetStatus() == instance.ShuttingDown {
 			writeError(w, http.StatusServiceUnavailable, "instance_shutting_down", "Instance is shutting down")
 			return
 		}
-
-		if !inst.IsRemote() && !inst.IsRunning() {
-			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict); err != nil {
+		// Read-only native GET never starts a process.
+		if r.Method != http.MethodGet && !inst.IsControlled() && !inst.IsRemote() && !inst.IsRunning() {
+			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict, r); err != nil {
 				writeStartError(w, err)
 				return
 			}
-		}
-
-		if !inst.IsRemote() {
-			h.stripLlamaCppPrefix(r, inst.Name)
 		}
 
 		// Use instance's ServeHTTP which tracks inflight requests and handles shutting down state
@@ -333,19 +336,7 @@ func (h *Handler) LlamaCppListModels() http.HandlerFunc {
 			return
 		}
 
-		// Check if instance is shutting down before autostart logic
-		if inst.GetStatus() == instance.ShuttingDown {
-			writeError(w, http.StatusServiceUnavailable, "instance_shutting_down", "Instance is shutting down")
-			return
-		}
-
-		if !inst.IsRemote() && !inst.IsRunning() {
-			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict); err != nil {
-				writeStartError(w, err)
-				return
-			}
-		}
-
+		_ = perm // Permission checked above; observation never autostarts.
 		// Modify request path to /models for proxying
 		r.URL.Path = "/models"
 
@@ -385,21 +376,24 @@ func (h *Handler) LlamaCppLoadModel() http.HandlerFunc {
 			return
 		}
 
-		// Check if instance is shutting down before autostart logic
-		if inst.GetStatus() == instance.ShuttingDown {
+		r.URL.Path = "/models/load"
+		release, err := inst.ReserveProxyRequest(w, r)
+		if err != nil {
+			return
+		}
+		defer release()
+		if !inst.IsControlled() && inst.GetStatus() == instance.ShuttingDown {
 			writeError(w, http.StatusServiceUnavailable, "instance_shutting_down", "Instance is shutting down")
 			return
 		}
-
-		if !inst.IsRemote() && !inst.IsRunning() {
-			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict); err != nil {
-				writeStartError(w, err)
+		if !inst.IsControlled() && !inst.IsRemote() && !inst.IsRunning() {
+			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict, r); err != nil {
+				if !writeAdmissionError(w, err) {
+					writeStartError(w, err)
+				}
 				return
 			}
 		}
-
-		// Modify request path to /models/load for proxying
-		r.URL.Path = "/models/load"
 
 		// Use instance's ServeHTTP which tracks inflight requests and handles shutting down state
 		err = inst.ServeHTTP(w, r)
@@ -437,19 +431,7 @@ func (h *Handler) LlamaCppUnloadModel() http.HandlerFunc {
 			return
 		}
 
-		// Check if instance is shutting down before autostart logic
-		if inst.GetStatus() == instance.ShuttingDown {
-			writeError(w, http.StatusServiceUnavailable, "instance_shutting_down", "Instance is shutting down")
-			return
-		}
-
-		if !inst.IsRemote() && !inst.IsRunning() {
-			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict); err != nil {
-				writeStartError(w, err)
-				return
-			}
-		}
-
+		_ = perm // Unload must never start a stopped process.
 		// Modify request path to /models/unload for proxying
 		r.URL.Path = "/models/unload"
 

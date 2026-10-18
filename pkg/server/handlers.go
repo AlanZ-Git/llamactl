@@ -31,17 +31,31 @@ var (
 
 // errorResponse represents an error response returned by the API
 type errorResponse struct {
-	Error   string `json:"error"`
-	Details string `json:"details,omitempty"`
+	Error     string `json:"error"`
+	Details   string `json:"details,omitempty"`
+	Retryable *bool  `json:"retryable,omitempty"`
 }
 
 // writeError writes a JSON error response with the specified HTTP status code
 func writeError(w http.ResponseWriter, status int, code, details string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(errorResponse{Error: code, Details: details}); err != nil {
+	response := errorResponse{Error: code, Details: details}
+	if code == "ai_paused" {
+		retryable := false
+		response.Retryable = &retryable
+	}
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Failed to encode error response: %v", err)
 	}
+}
+
+func writeAdmissionError(w http.ResponseWriter, err error) bool {
+	status, code, ok := instance.AdmissionHTTPError(err)
+	if ok {
+		writeError(w, status, code, err.Error())
+	}
+	return ok
 }
 
 // writeJSON writes a JSON response with the specified HTTP status code
@@ -121,13 +135,24 @@ func (h *Handler) getInstance(r *http.Request) (*instance.Instance, error) {
 // canStart controls whether the key may auto-start a stopped instance; canEvict controls whether it may
 // trigger LRU eviction of other instances to make room. It performs hierarchical eviction when allowed:
 // group quota check first, then global capacity check.
-func (h *Handler) ensureInstanceRunning(inst *instance.Instance, canStart bool, canEvict bool) error {
+func (h *Handler) ensureInstanceRunning(inst *instance.Instance, canStart bool, canEvict bool, requests ...*http.Request) error {
+	release, err := inst.AcquireAutomaticUse()
+	if err != nil {
+		return err
+	}
+	defer release()
 	if !canStart {
 		return ErrInstanceNotRunning
 	}
 
 	// See Handler.startMu for why the start section is serialized.
 	h.startMu.Lock()
+	for _, r := range requests {
+		if err := inst.CheckRequestPolicy(r); err != nil {
+			h.startMu.Unlock()
+			return err
+		}
+	}
 	startErr := h.maybeStartLocked(inst, canEvict)
 	h.startMu.Unlock()
 	if startErr != nil {
@@ -153,6 +178,9 @@ func (h *Handler) ensureInstanceRunning(inst *instance.Instance, canStart bool, 
 // served.
 func (h *Handler) maybeStartLocked(inst *instance.Instance, canEvict bool) error {
 	options := inst.GetOptions()
+	if options != nil && options.Controlled {
+		return &instance.AdmissionError{Code: "instance_not_running", Details: "controlled instances are use-running-only"}
+	}
 	if options == nil || options.OnDemandStart == nil || !*options.OnDemandStart {
 		return fmt.Errorf("instance is not running and on-demand start is not enabled")
 	}
@@ -181,7 +209,13 @@ func (h *Handler) maybeStartLocked(inst *instance.Instance, canEvict bool) error
 		}
 	}
 
-	if _, err := h.InstanceManager.StartInstance(inst.Name); err != nil {
+	start := h.InstanceManager.StartInstance
+	if automatic, ok := h.InstanceManager.(interface {
+		StartInstanceAutomatic(string) (*instance.Instance, error)
+	}); ok {
+		start = automatic.StartInstanceAutomatic
+	}
+	if _, err := start(inst.Name); err != nil {
 		return fmt.Errorf("failed to start instance: %w", err)
 	}
 
@@ -198,6 +232,13 @@ func (h *Handler) rejectIfAtCapacity() error {
 // writeStartError maps an ensureInstanceRunning error to the appropriate HTTP response.
 // Shared by every auto-start call site.
 func writeStartError(w http.ResponseWriter, err error) {
+	if _, code, ok := instance.AdmissionHTTPError(err); ok && code == "ai_paused" {
+		writeError(w, http.StatusServiceUnavailable, code, err.Error())
+		return
+	}
+	if writeAdmissionError(w, err) {
+		return
+	}
 	switch {
 	case errors.Is(err, ErrInstanceNotRunning):
 		writeError(w, http.StatusServiceUnavailable, "instance_not_running", err.Error())

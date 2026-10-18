@@ -10,6 +10,7 @@ import (
 
 	"llamactl/pkg/backends"
 	"llamactl/pkg/config"
+	"llamactl/pkg/resourcepolicy"
 )
 
 // Instance represents a running instance of llama server
@@ -23,6 +24,9 @@ type Instance struct {
 	globalBackendSettings  *config.BackendConfig
 	globalNodesConfig      map[string]config.NodeConfig
 	localNodeName          string `json:"-"` // Name of the local node for remote detection
+
+	admission admissionGate
+	policy    *resourcepolicy.Gate
 
 	status  *status  `json:"-"`
 	options *options `json:"-"`
@@ -46,6 +50,16 @@ func New(name string, globalConfig *config.AppConfig, opts *Options, onStatusCha
 
 // NewChecked creates an instance only after its configuration and preset are ready.
 func NewChecked(name string, globalConfig *config.AppConfig, opts *Options, onStatusChange func(oldStatus, newStatus Status)) (*Instance, error) {
+	return newChecked(name, globalConfig, opts, onStatusChange, true)
+}
+
+// NewDescriptor validates a stopped configuration without writing a preset or
+// starting a child. Explicit start/options application prepares the preset later.
+func NewDescriptor(name string, globalConfig *config.AppConfig, opts *Options, onStatusChange func(oldStatus, newStatus Status)) (*Instance, error) {
+	return newChecked(name, globalConfig, opts, onStatusChange, false)
+}
+
+func newChecked(name string, globalConfig *config.AppConfig, opts *Options, onStatusChange func(oldStatus, newStatus Status), prepare bool) (*Instance, error) {
 	if globalConfig == nil {
 		return nil, fmt.Errorf("instance configuration cannot be nil")
 	}
@@ -60,6 +74,9 @@ func NewChecked(name string, globalConfig *config.AppConfig, opts *Options, onSt
 	globalNodesConfig := globalConfig.Nodes
 	localNodeName := globalConfig.LocalNode
 
+	if err := opts.ValidateControlled(globalConfig); err != nil {
+		return nil, fmt.Errorf("prepare controlled mode: %w", err)
+	}
 	if err := opts.ValidateEnvironmentPolicy(globalConfig); err != nil {
 		return nil, fmt.Errorf("prepare environment: %w", err)
 	}
@@ -95,6 +112,15 @@ func NewChecked(name string, globalConfig *config.AppConfig, opts *Options, onSt
 
 	// Only create logger, proxy, and process for local instances
 	if !instance.IsRemote() {
+		instance.policy = globalConfig.ResourcePolicy
+		var permit *resourcepolicy.Permit
+		if prepare {
+			permit, err = instance.policy.Acquire()
+			if err != nil {
+				return nil, err
+			}
+			defer permit.Close()
+		}
 		logRotationConfig := &LogRotationConfig{
 			Enabled:  globalInstanceSettings.LogRotationEnabled,
 			MaxSize:  globalInstanceSettings.LogRotationMaxSize,
@@ -107,8 +133,13 @@ func NewChecked(name string, globalConfig *config.AppConfig, opts *Options, onSt
 		)
 		instance.process = newProcess(instance)
 
-		if err := syncPresetIni(name, opts, globalInstanceSettings.InstancesDir); err != nil {
-			return nil, fmt.Errorf("prepare instance preset: %w", err)
+		if prepare {
+			if err := permit.Check(); err != nil {
+				return nil, err
+			}
+			if err := syncPresetIniAdmitted(name, opts, globalInstanceSettings.InstancesDir, permit); err != nil {
+				return nil, fmt.Errorf("prepare instance preset: %w", err)
+			}
 		}
 	}
 
@@ -117,6 +148,15 @@ func NewChecked(name string, globalConfig *config.AppConfig, opts *Options, onSt
 
 // Start starts the instance
 func (i *Instance) Start() error {
+	m, err := i.BeginWorkMaintenance()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	return m.Start()
+}
+
+func (i *Instance) start() error {
 	if i.process == nil {
 		return fmt.Errorf("instance %s has no process component (remote instances cannot be started locally)", i.Name)
 	}
@@ -125,6 +165,15 @@ func (i *Instance) Start() error {
 
 // Stop stops the instance
 func (i *Instance) Stop() error {
+	m, err := i.BeginMaintenance()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	return m.Stop()
+}
+
+func (i *Instance) stop() error {
 	if i.process == nil {
 		return fmt.Errorf("instance %s has no process component (remote instances cannot be stopped locally)", i.Name)
 	}
@@ -136,7 +185,12 @@ func (i *Instance) Restart() error {
 	if i.process == nil {
 		return fmt.Errorf("instance %s has no process component (remote instances cannot be restarted locally)", i.Name)
 	}
-	return i.process.restart()
+	m, err := i.BeginWorkMaintenance()
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	return m.Restart()
 }
 
 // WaitForHealthy waits for the instance to become healthy
@@ -173,6 +227,8 @@ func (i *Instance) GetStatus() Status {
 
 // SetStatus sets the status
 func (i *Instance) SetStatus(s Status) {
+	i.admission.mu.Lock()
+	defer i.admission.mu.Unlock()
 	if i.status != nil {
 		i.status.set(s)
 	}
@@ -270,6 +326,9 @@ func (i *Instance) UpdateLastRequestTime() {
 
 // ShouldTimeout checks if the instance should timeout based on idle time
 func (i *Instance) ShouldTimeout() bool {
+	if i.IsControlled() {
+		return false
+	}
 	if i.proxy == nil {
 		return false
 	}
@@ -286,6 +345,10 @@ func (i *Instance) GetInflightRequests() int32 {
 
 // ServeHTTP serves HTTP requests through the proxy with request tracking and shutdown handling
 func (i *Instance) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
+	return i.serveAdmitted(w, r)
+}
+
+func (i *Instance) forwardHTTP(w http.ResponseWriter, r *http.Request) error {
 	if i.proxy == nil {
 		return fmt.Errorf("instance %s has no proxy component", i.Name)
 	}

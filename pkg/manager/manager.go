@@ -7,6 +7,7 @@ import (
 	"llamactl/pkg/config"
 	"llamactl/pkg/database"
 	"llamactl/pkg/instance"
+	"llamactl/pkg/resourcepolicy"
 	"log"
 	"sort"
 	"sync"
@@ -39,7 +40,8 @@ type instanceManager struct {
 	lifecycle *lifecycleManager
 
 	// Configuration
-	globalConfig *config.AppConfig
+	globalConfig   *config.AppConfig
+	startupBlocked bool
 
 	// Synchronization
 	instanceLocks sync.Map // map[string]*sync.Mutex - per-instance locks for concurrent operations
@@ -48,6 +50,14 @@ type instanceManager struct {
 
 // New creates a new instance of InstanceManager with dependency injection.
 func New(globalConfig *config.AppConfig, db database.InstanceStore) InstanceManager {
+	policy, err := resourcepolicy.Open(globalConfig.DataDir)
+	if policy == nil {
+		panic(fmt.Errorf("cannot initialize owner policy: %w", err))
+	}
+	if err != nil {
+		log.Printf("Owner policy blocked: %v", err)
+	}
+	globalConfig.ResourcePolicy = policy
 
 	if globalConfig.Instances.TimeoutCheckInterval <= 0 {
 		globalConfig.Instances.TimeoutCheckInterval = 5 // Default to 5 minutes if not set
@@ -65,11 +75,12 @@ func New(globalConfig *config.AppConfig, db database.InstanceStore) InstanceMana
 
 	// Create manager instance
 	im := &instanceManager{
-		registry:     registry,
-		ports:        ports,
-		db:           db,
-		remote:       remote,
-		globalConfig: globalConfig,
+		registry:       registry,
+		ports:          ports,
+		db:             db,
+		remote:         remote,
+		globalConfig:   globalConfig,
+		startupBlocked: !policy.Snapshot().AllowAI,
 	}
 
 	// Initialize lifecycle manager (needs reference to manager for Stop/Evict operations)
@@ -116,12 +127,19 @@ func (im *instanceManager) Shutdown() {
 			}(inst)
 		}
 		wg.Wait()
-		log.Println("All instances stopped.")
+		log.Println("Instance shutdown attempts completed.")
 	})
 }
 
 // loadInstances restores all instances from the persistence layer
 func (im *instanceManager) loadInstances() error {
+	bootPermit, _ := im.globalConfig.ResourcePolicy.Acquire()
+	launched := false
+	defer func() {
+		if !launched {
+			bootPermit.Close()
+		}
+	}()
 	// Load all instances from persistence
 	instances, err := im.db.LoadAll()
 	if err != nil {
@@ -146,7 +164,8 @@ func (im *instanceManager) loadInstances() error {
 	log.Printf("Loaded %d instances from persistence", loaded)
 
 	// Only successfully prepared instances are eligible for autostart.
-	go im.autoStartInstances()
+	launched = true
+	go im.autoStartInstancesWithPermit(bootPermit)
 
 	return errors.Join(failures...)
 }
@@ -179,7 +198,11 @@ func (im *instanceManager) loadInstance(persistedInst *instance.Instance) error 
 	}
 
 	// Create new inst using NewInstance (handles validation, defaults, setup)
-	inst, err := instance.NewChecked(name, im.globalConfig, options, statusCallback)
+	constructor := instance.NewChecked
+	if im.startupBlocked && !isRemote {
+		constructor = instance.NewDescriptor
+	}
+	inst, err := constructor(name, im.globalConfig, options, statusCallback)
 	if err != nil {
 		return fmt.Errorf("prepare persisted instance: %w", err)
 	}
@@ -187,7 +210,11 @@ func (im *instanceManager) loadInstance(persistedInst *instance.Instance) error 
 	// Restore persisted fields that NewInstance doesn't set
 	inst.ID = persistedInst.ID
 	inst.Created = persistedInst.Created
-	inst.SetStatus(persistedInst.GetStatus())
+	if inst.IsControlled() || (im.startupBlocked && !isRemote) {
+		inst.SetStatus(instance.Stopped)
+	} else {
+		inst.SetStatus(persistedInst.GetStatus())
+	}
 
 	// Handle remote instance mapping
 	if isRemote {
@@ -222,12 +249,21 @@ func (im *instanceManager) loadInstance(persistedInst *instance.Instance) error 
 // autoStartInstances starts instances that were running when persisted and have auto-restart enabled
 // For instances with auto-restart disabled, it sets their status to Stopped
 func (im *instanceManager) autoStartInstances() {
+	permit, _ := im.globalConfig.ResourcePolicy.Acquire()
+	im.autoStartInstancesWithPermit(permit)
+}
+
+func (im *instanceManager) autoStartInstancesWithPermit(permit *resourcepolicy.Permit) {
+	defer permit.Close()
 	instances := im.registry.list()
 
 	var instancesToStart []*instance.Instance
 	var instancesToStop []*instance.Instance
 
 	for _, inst := range instances {
+		if inst.IsControlled() || (im.startupBlocked && !inst.IsRemote()) {
+			continue
+		}
 		if inst.IsRunning() && // Was running when persisted
 			inst.GetOptions() != nil &&
 			inst.GetOptions().AutoRestart != nil {
@@ -243,8 +279,7 @@ func (im *instanceManager) autoStartInstances() {
 	// Stop instances that have auto-restart disabled
 	for _, inst := range instancesToStop {
 		log.Printf("Instance %s was running but auto-restart is disabled, setting status to stopped", inst.Name)
-		inst.SetStatus(instance.Stopped)
-		im.registry.markStopped(inst.Name)
+		im.markAutomaticStopped(inst)
 	}
 
 	// Start instances that have auto-restart enabled. Enforce group and
@@ -264,8 +299,7 @@ func (im *instanceManager) autoStartInstances() {
 	// Start() marks its own instance running again, so earlier starts in this
 	// loop — and concurrent on-demand starts — still count against the limits.
 	for _, inst := range instancesToStart {
-		inst.SetStatus(instance.Stopped)
-		im.registry.markStopped(inst.Name)
+		im.markAutomaticStopped(inst)
 	}
 
 	limits := im.globalConfig.Instances
@@ -301,13 +335,35 @@ func (im *instanceManager) autoStartInstances() {
 				continue
 			}
 		} else {
+			if im.startupBlocked || (im.globalConfig.ResourcePolicy != nil && permit == nil) {
+				continue
+			}
+			if err := permit.Check(); err != nil {
+				continue
+			}
 			// Local instance - call Start() directly
-			if err := inst.Start(); err != nil {
+			if err := inst.StartAutomatic(); err != nil {
 				log.Printf("Failed to auto-start instance %s: %v", inst.Name, err)
 				continue
 			}
 		}
 	}
+}
+
+// markAutomaticStopped rechecks mode under admission before resetting restored
+// legacy state. A concurrent stopped-mode transition must not reset a newly
+// explicitly started controlled instance.
+func (im *instanceManager) markAutomaticStopped(inst *instance.Instance) {
+	lease, err := inst.BeginMaintenance()
+	if err != nil {
+		return
+	}
+	defer lease.Close()
+	if inst.IsControlled() {
+		return
+	}
+	inst.SetStatus(instance.Stopped)
+	im.registry.markStopped(inst.Name)
 }
 
 func (im *instanceManager) onStatusChange(name string, _, newStatus instance.Status) {

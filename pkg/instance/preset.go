@@ -3,6 +3,7 @@ package instance
 import (
 	"fmt"
 	"llamactl/pkg/config"
+	"llamactl/pkg/resourcepolicy"
 	"os"
 	"path/filepath"
 )
@@ -103,13 +104,24 @@ func (p *preparedPreset) commit() error {
 	return nil
 }
 
+func (p *preparedPreset) commitPolicy(permit *resourcepolicy.Permit) error {
+	if err := permit.Check(); err != nil {
+		return err
+	}
+	return p.commit()
+}
+
 func syncPresetIni(name string, opts *Options, instancesDir string) error {
+	return syncPresetIniAdmitted(name, opts, instancesDir, nil)
+}
+
+func syncPresetIniAdmitted(name string, opts *Options, instancesDir string, permit *resourcepolicy.Permit) error {
 	p, err := preparePresetIni(name, opts, instancesDir)
 	if err != nil {
 		return err
 	}
 	defer p.cleanup()
-	return p.commit()
+	return p.commitPolicy(permit)
 }
 
 // PreparedOptions is a single candidate, not a file/DB/process transaction.
@@ -119,9 +131,39 @@ type PreparedOptions struct {
 	opts      *Options
 	preset    *preparedPreset
 	committed bool
+	lease     *Maintenance
+	ownsLease bool
+	closed    bool
 }
 
 func (i *Instance) PrepareOptions(opts *Options) (*PreparedOptions, error) {
+	lease, err := i.BeginWorkMaintenance()
+	if err != nil {
+		return nil, err
+	}
+	p, err := lease.PrepareOptions(opts)
+	if err != nil {
+		lease.Close()
+		return nil, err
+	}
+	p.ownsLease = true
+	return p, nil
+}
+
+func (m *Maintenance) PrepareOptions(opts *Options) (*PreparedOptions, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.valid(); err != nil {
+		return nil, err
+	}
+	return m.prepareOptions(opts)
+}
+
+func (m *Maintenance) prepareOptions(opts *Options) (*PreparedOptions, error) {
+	if err := m.checkModeChange(opts); err != nil {
+		return nil, err
+	}
+	i := m.instance
 	candidate, err := opts.Clone()
 	if err != nil {
 		return nil, fmt.Errorf("prepare options: %w", err)
@@ -130,6 +172,9 @@ func (i *Instance) PrepareOptions(opts *Options) (*PreparedOptions, error) {
 		candidate.Nodes = i.GetOptions().Nodes
 	}
 	cfg := i.appConfig()
+	if err := candidate.ValidateControlled(cfg); err != nil {
+		return nil, fmt.Errorf("prepare controlled mode: %w", err)
+	}
 	if err := candidate.ValidateEnvironmentPolicy(cfg); err != nil {
 		return nil, fmt.Errorf("prepare environment: %w", err)
 	}
@@ -137,7 +182,7 @@ func (i *Instance) PrepareOptions(opts *Options) (*PreparedOptions, error) {
 		return nil, fmt.Errorf("prepare backend: %w", err)
 	}
 	candidate.validateAndApplyDefaults(i.Name, i.globalInstanceSettings)
-	p := &PreparedOptions{instance: i, opts: candidate}
+	p := &PreparedOptions{instance: i, opts: candidate, lease: m}
 	if !i.IsRemote() && i.globalInstanceSettings != nil {
 		p.preset, err = preparePresetIni(i.Name, candidate, i.globalInstanceSettings.InstancesDir)
 		if err != nil {
@@ -147,9 +192,37 @@ func (i *Instance) PrepareOptions(opts *Options) (*PreparedOptions, error) {
 	return p, nil
 }
 
-func (p *PreparedOptions) Close() { p.preset.cleanup() }
+func (p *PreparedOptions) Close() {
+	p.lease.mu.Lock()
+	p.preset.cleanup()
+	p.closed = true
+	p.lease.mu.Unlock()
+	if p.ownsLease {
+		p.lease.Close()
+	}
+}
 
 func (p *PreparedOptions) Commit() error {
+	p.lease.mu.Lock()
+	if err := p.lease.valid(); err != nil {
+		p.lease.mu.Unlock()
+		return err
+	}
+	err := p.commit()
+	p.lease.mu.Unlock()
+	if err == nil && p.ownsLease {
+		p.lease.Close()
+	}
+	return err
+}
+
+func (p *PreparedOptions) commit() error {
+	if err := p.lease.checkPolicy(); err != nil {
+		return err
+	}
+	if p.closed {
+		return fmt.Errorf("options candidate is closed")
+	}
 	if p.committed {
 		return fmt.Errorf("options candidate already committed")
 	}
@@ -166,10 +239,15 @@ func (p *PreparedOptions) Commit() error {
 	if !i.IsRemote() && (i.GetStatus() == Running || i.GetStatus() == ShuttingDown || i.GetStatus() == Restarting) {
 		return fmt.Errorf("commit options requires a stopped instance")
 	}
-	if err := p.preset.commit(); err != nil {
+	if err := p.lease.checkPolicy(); err != nil {
 		return err
 	}
+	if err := p.preset.commitPolicy(p.lease.permit); err != nil {
+		return err
+	}
+	i.admission.mu.Lock()
 	i.options.set(p.opts)
+	i.admission.mu.Unlock()
 	if i.proxy != nil {
 		i.proxy.clear()
 	}

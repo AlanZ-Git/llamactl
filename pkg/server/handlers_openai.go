@@ -206,8 +206,23 @@ func (h *Handler) OpenAIProxy() http.HandlerFunc {
 			return
 		}
 
+		// Validate original bytes before model rewriting can collapse duplicate keys
+		// or shrink whitespace. Hold use through final forwarding/mode checks.
+		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		r.ContentLength = int64(len(bodyBytes))
+		release, err := inst.PrepareInferenceRequest(r)
+		if err != nil {
+			status, code, _ := instance.AdmissionHTTPError(err)
+			if code == "ai_paused" {
+				status = http.StatusServiceUnavailable
+			}
+			writeError(w, status, code, err.Error())
+			return
+		}
+		defer release()
+
 		// Check if instance is shutting down before autostart logic
-		if inst.GetStatus() == instance.ShuttingDown {
+		if !inst.IsControlled() && inst.GetStatus() == instance.ShuttingDown {
 			writeError(w, http.StatusServiceUnavailable, "instance_shutting_down", "Instance is shutting down")
 			return
 		}
@@ -224,8 +239,8 @@ func (h *Handler) OpenAIProxy() http.HandlerFunc {
 			}
 		}
 
-		if !inst.IsRemote() && !inst.IsRunning() {
-			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict); err != nil {
+		if !inst.IsControlled() && !inst.IsRemote() && !inst.IsRunning() {
+			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict, r); err != nil {
 				writeStartError(w, err)
 				return
 			}

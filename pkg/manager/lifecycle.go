@@ -84,7 +84,7 @@ func (l *lifecycleManager) checkTimeouts() {
 	// Identify instances that should timeout
 	for _, inst := range instances {
 		// Skip remote instances - they are managed by their respective nodes
-		if inst.IsRemote() {
+		if inst.IsRemote() || inst.IsControlled() {
 			continue
 		}
 
@@ -108,7 +108,7 @@ func (l *lifecycleManager) checkTimeouts() {
 	// Stop the timed-out instances
 	for _, name := range timeoutInstances {
 		log.Printf("Instance %s has timed out, stopping it", name)
-		if _, err := l.manager.StopInstance(name); err != nil {
+		if _, err := l.stopAutomatic(name); err != nil {
 			log.Printf("Error stopping instance %s: %v", name, err)
 		} else {
 			log.Printf("Instance %s stopped successfully", name)
@@ -132,7 +132,7 @@ func (l *lifecycleManager) evictLRU(groupLabel string) error {
 
 	for _, inst := range runningInstances {
 		// Skip remote instances - they are managed by their respective nodes
-		if inst.IsRemote() {
+		if inst.IsRemote() || inst.IsControlled() {
 			continue
 		}
 
@@ -170,6 +170,13 @@ func (l *lifecycleManager) evictLRU(groupLabel string) error {
 
 	// Evict the LRU instance
 	log.Printf("Evicting LRU instance %s", lruInstance.Name)
-	_, err := l.manager.StopInstance(lruInstance.Name)
+	_, err := l.stopAutomatic(lruInstance.Name)
 	return err
+}
+
+func (l *lifecycleManager) stopAutomatic(name string) (*instance.Instance, error) {
+	if im, ok := l.manager.(*instanceManager); ok {
+		return im.stopAutomatic(name)
+	}
+	return l.manager.StopInstance(name)
 }

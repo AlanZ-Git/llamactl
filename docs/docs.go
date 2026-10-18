@@ -2727,6 +2727,10 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "controlled": {
+                    "description": "Atomic use/maintenance admission foundation; absent/false is legacy. Requires isolated native llama.cpp. Owner admission policy is separate; process release is not implemented.",
+                    "type": "boolean"
+                },
                 "environment_policy": {
                     "type": "string"
                 },

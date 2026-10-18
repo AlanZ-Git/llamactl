@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"llamactl/pkg/backends"
 	"llamactl/pkg/instance"
+	"llamactl/pkg/resourcepolicy"
 	"llamactl/pkg/validation"
 	"slices"
 	"strings"
@@ -60,9 +61,42 @@ func (im *instanceManager) ListInstances() ([]*instance.Instance, error) {
 // CreateInstance creates a new instance with the given options and returns it.
 // The instance is initially in a "stopped" state.
 func (im *instanceManager) CreateInstance(name string, options *instance.Options) (*instance.Instance, error) {
+	var permit *resourcepolicy.Permit
+	local := true
+	if options != nil && len(options.Nodes) > 0 {
+		_, local = options.Nodes[im.globalConfig.LocalNode]
+	}
+	if local {
+		var err error
+		permit, err = im.globalConfig.ResourcePolicy.Acquire()
+		if err != nil {
+			return nil, err
+		}
+		defer permit.Close()
+	}
 	lock := im.lockInstance(name)
-	lock.Lock()
+	if options != nil && options.Controlled {
+		if !lock.TryLock() {
+			return nil, instance.BusyError()
+		}
+	} else {
+		if existing, ok := im.registry.get(name); ok && existing.IsControlled() {
+			if !lock.TryLock() {
+				return nil, instance.BusyError()
+			}
+		} else {
+			lock.Lock()
+		}
+	}
 	defer lock.Unlock()
+	if existing, ok := im.registry.get(name); ok {
+		lease, err := existing.BeginMaintenance()
+		if err != nil {
+			return nil, err
+		}
+		lease.Close()
+		return nil, fmt.Errorf("instance with name %s already exists", name)
+	}
 	if options == nil {
 		return nil, fmt.Errorf("instance options cannot be nil")
 	}
@@ -70,6 +104,9 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 	options, err := options.Clone()
 	if err != nil {
 		return nil, err
+	}
+	if err := options.ValidateControlled(im.globalConfig); err != nil {
+		return nil, fmt.Errorf("prepare controlled mode: %w", err)
 	}
 	if err := options.ValidateEnvironmentPolicy(im.globalConfig); err != nil {
 		return nil, fmt.Errorf("prepare environment: %w", err)
@@ -145,6 +182,9 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 		return inst, nil
 	}
 
+	if err := permit.Check(); err != nil {
+		return nil, err
+	}
 	// Local instance creation
 	// Check max instances limit for local instances only
 	totalInstances := im.registry.count()
@@ -187,6 +227,17 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 		return nil, fmt.Errorf("prepare instance: %w", err)
 	}
 
+	lease, err := inst.BeginMaintenance()
+	if err != nil {
+		im.ports.release(allocatedPort)
+		return nil, err
+	}
+	defer lease.Close()
+
+	if err := permit.Check(); err != nil {
+		im.ports.release(allocatedPort)
+		return nil, err
+	}
 	// Add to registry
 	if err := im.registry.add(inst); err != nil {
 		// Rollback: release port
@@ -195,6 +246,7 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 	}
 
 	if err := im.persistInstance(inst); err != nil {
+		_ = lease.Retire()
 		im.registry.remove(name)
 		im.ports.release(allocatedPort)
 		return nil, fmt.Errorf("persist created instance (preset may already be committed): %w", err)
@@ -246,6 +298,9 @@ func (im *instanceManager) GetInstance(name string) (*instance.Instance, error) 
 // UpdateInstance updates the options of an existing instance and returns it.
 // If the instance is running, it will be restarted to apply the new options.
 func (im *instanceManager) UpdateInstance(name string, options *instance.Options) (*instance.Instance, error) {
+	if options == nil {
+		return nil, fmt.Errorf("instance options cannot be nil")
+	}
 	inst, exists := im.registry.get(name)
 	if !exists {
 		return nil, fmt.Errorf("instance with name %s not found", name)
@@ -253,6 +308,9 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 
 	// Check if instance is remote and delegate to remote operation
 	if node := im.getNodeForInstance(inst); node != nil {
+		if options.Controlled {
+			return nil, fmt.Errorf("controlled mode requires a local instance")
+		}
 		ctx := context.Background()
 		remoteInst, err := im.remote.updateInstance(ctx, node, name, options)
 		if err != nil {
@@ -272,13 +330,21 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 		return inst, nil
 	}
 
-	if options == nil {
-		return nil, fmt.Errorf("instance options cannot be nil")
-	}
-
-	options, err := options.Clone()
+	lease, err := inst.BeginWorkMaintenance()
 	if err != nil {
 		return nil, err
+	}
+	defer lease.Close()
+	if err := lease.CheckModeChange(options); err != nil {
+		return nil, err
+	}
+
+	options, err = options.Clone()
+	if err != nil {
+		return nil, err
+	}
+	if err := options.ValidateControlled(im.globalConfig); err != nil {
+		return nil, fmt.Errorf("prepare controlled mode: %w", err)
 	}
 	if err := options.ValidateEnvironmentPolicy(im.globalConfig); err != nil {
 		return nil, fmt.Errorf("prepare environment: %w", err)
@@ -327,7 +393,7 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 			im.ports.release(allocatedPort)
 		}
 	}()
-	prepared, err := inst.PrepareOptions(options)
+	prepared, err := lease.PrepareOptions(options)
 	if err != nil {
 		return nil, fmt.Errorf("prepare update: %w", err)
 	}
@@ -338,7 +404,7 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 
 	// If the instance is running, stop it first
 	if wasRunning {
-		if err := inst.Stop(); err != nil {
+		if err := lease.Stop(); err != nil {
 			return nil, fmt.Errorf("failed to stop instance %s for update: %w", name, err)
 		}
 	}
@@ -356,7 +422,7 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 
 	// If it was running before, start it again with the new options
 	if wasRunning {
-		if err := inst.Start(); err != nil {
+		if err := lease.Start(); err != nil {
 			return nil, fmt.Errorf("failed to start instance %s after update: %w", name, err)
 		}
 	}
@@ -400,6 +466,12 @@ func (im *instanceManager) DeleteInstance(name string) error {
 		return nil
 	}
 
+	lease, err := inst.BeginMaintenance()
+	if err != nil {
+		return err
+	}
+	defer lease.Close()
+
 	// Lock this specific instance and clean up the lock on completion
 	lock := im.lockInstance(name)
 	lock.Lock()
@@ -408,6 +480,10 @@ func (im *instanceManager) DeleteInstance(name string) error {
 	status := inst.GetStatus()
 	if status == instance.Running || status == instance.Restarting {
 		return fmt.Errorf("instance with name %s is still running, stop it before deleting", name)
+	}
+
+	if err := lease.Retire(); err != nil {
+		return err
 	}
 
 	// Release port (use ReleaseByInstance for proper cleanup)
@@ -429,6 +505,15 @@ func (im *instanceManager) DeleteInstance(name string) error {
 // StartInstance starts a stopped instance and returns it.
 // If the instance is already running, it returns an error.
 func (im *instanceManager) StartInstance(name string) (*instance.Instance, error) {
+	return im.startInstance(name, false)
+}
+
+// StartInstanceAutomatic rechecks mode inside the acquired maintenance lease.
+func (im *instanceManager) StartInstanceAutomatic(name string) (*instance.Instance, error) {
+	return im.startInstance(name, true)
+}
+
+func (im *instanceManager) startInstance(name string, automatic bool) (*instance.Instance, error) {
 	inst, exists := im.registry.get(name)
 	if !exists {
 		return nil, fmt.Errorf("instance with name %s not found", name)
@@ -450,17 +535,26 @@ func (im *instanceManager) StartInstance(name string) (*instance.Instance, error
 		return inst, nil
 	}
 
+	lease, err := inst.BeginWorkMaintenance()
+	if err != nil {
+		return nil, err
+	}
+	defer lease.Close()
+
 	// Lock this specific instance only
 	lock := im.lockInstance(name)
 	lock.Lock()
 	defer lock.Unlock()
 
 	// Idempotent: if already running, just return success
+	if automatic && inst.IsControlled() {
+		return nil, &instance.AdmissionError{Code: "instance_not_running", Details: "controlled instances require explicit start"}
+	}
 	if inst.IsRunning() {
 		return inst, nil
 	}
 
-	if err := inst.Start(); err != nil {
+	if err := lease.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start instance %s: %w", name, err)
 	}
 
@@ -490,6 +584,14 @@ func (im *instanceManager) AtMaxRunning() bool {
 
 // StopInstance stops a running instance and returns it.
 func (im *instanceManager) StopInstance(name string) (*instance.Instance, error) {
+	return im.stopInstance(name, false)
+}
+
+func (im *instanceManager) stopAutomatic(name string) (*instance.Instance, error) {
+	return im.stopInstance(name, true)
+}
+
+func (im *instanceManager) stopInstance(name string, automatic bool) (*instance.Instance, error) {
 	inst, exists := im.registry.get(name)
 	if !exists {
 		return nil, fmt.Errorf("instance with name %s not found", name)
@@ -511,17 +613,26 @@ func (im *instanceManager) StopInstance(name string) (*instance.Instance, error)
 		return inst, nil
 	}
 
+	lease, err := inst.BeginMaintenance()
+	if err != nil {
+		return nil, err
+	}
+	defer lease.Close()
+
 	// Lock this specific instance only
 	lock := im.lockInstance(name)
 	lock.Lock()
 	defer lock.Unlock()
 
 	// Idempotent: if already stopped, just return success
+	if automatic && inst.IsControlled() {
+		return nil, &instance.AdmissionError{Code: "maintenance_required", Details: "controlled instances cannot be automatically stopped or evicted"}
+	}
 	if !inst.IsRunning() {
 		return inst, nil
 	}
 
-	if err := inst.Stop(); err != nil {
+	if err := lease.Stop(); err != nil {
 		return nil, fmt.Errorf("failed to stop instance %s: %w", name, err)
 	}
 
@@ -556,12 +667,18 @@ func (im *instanceManager) RestartInstance(name string) (*instance.Instance, err
 		return inst, nil
 	}
 
+	lease, err := inst.BeginWorkMaintenance()
+	if err != nil {
+		return nil, err
+	}
+	defer lease.Close()
+
 	// Lock this specific instance for the entire restart operation to ensure atomicity
 	lock := im.lockInstance(name)
 	lock.Lock()
 	defer lock.Unlock()
 
-	if err := inst.Restart(); err != nil {
+	if err := lease.Restart(); err != nil {
 		return nil, fmt.Errorf("restart instance %s: %w", name, err)
 	}
 
