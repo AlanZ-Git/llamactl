@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"llamactl/pkg/config"
 	"llamactl/pkg/database"
@@ -131,20 +132,23 @@ func (im *instanceManager) loadInstances() error {
 		return nil
 	}
 
+	var failures []error
+	loaded := 0
 	// Process each loaded instance
 	for _, persistedInst := range instances {
 		if err := im.loadInstance(persistedInst); err != nil {
-			log.Printf("Failed to load instance %s: %v", persistedInst.Name, err)
+			failures = append(failures, fmt.Errorf("load instance %s: %w", persistedInst.Name, err))
 			continue
 		}
+		loaded++
 	}
 
-	log.Printf("Loaded %d instances from persistence", len(instances))
+	log.Printf("Loaded %d instances from persistence", loaded)
 
-	// Auto-start instances that have auto-restart enabled
+	// Only successfully prepared instances are eligible for autostart.
 	go im.autoStartInstances()
 
-	return nil
+	return errors.Join(failures...)
 }
 
 // loadInstance loads a single persisted instance and adds it to the registry
@@ -175,7 +179,10 @@ func (im *instanceManager) loadInstance(persistedInst *instance.Instance) error 
 	}
 
 	// Create new inst using NewInstance (handles validation, defaults, setup)
-	inst := instance.New(name, im.globalConfig, options, statusCallback)
+	inst, err := instance.NewChecked(name, im.globalConfig, options, statusCallback)
+	if err != nil {
+		return fmt.Errorf("prepare persisted instance: %w", err)
+	}
 
 	// Restore persisted fields that NewInstance doesn't set
 	inst.ID = persistedInst.ID
@@ -200,6 +207,12 @@ func (im *instanceManager) loadInstance(persistedInst *instance.Instance) error 
 
 	// Add instance to registry
 	if err := im.registry.add(inst); err != nil {
+		if !isRemote && inst.GetPort() > 0 {
+			im.ports.release(inst.GetPort())
+		}
+		if isRemote {
+			im.remote.removeInstance(name)
+		}
 		return fmt.Errorf("failed to add instance to registry: %w", err)
 	}
 

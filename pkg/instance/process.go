@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"runtime"
 	"sync"
@@ -52,6 +51,19 @@ func (p *process) start() error {
 		return fmt.Errorf("instance %s has no options set", p.instance.Name)
 	}
 
+	// Re-prepare on every start, including automatic restart. Options, not any
+	// stale on-disk preset, are authoritative.
+	candidate, err := p.instance.GetOptions().Clone()
+	if err != nil {
+		return fmt.Errorf("prepare start options: %w", err)
+	}
+	if err := candidate.ValidateEnvironmentPolicy(p.instance.appConfig()); err != nil {
+		return fmt.Errorf("prepare start environment: %w", err)
+	}
+	if err := syncPresetIni(p.instance.Name, candidate, p.instance.globalInstanceSettings.InstancesDir); err != nil {
+		return fmt.Errorf("prepare start preset: %w", err)
+	}
+
 	// Reset restart counter when manually starting (not during auto-restart)
 	// We can detect auto-restart by checking if restartCancel is set
 	if p.restartCancel == nil {
@@ -64,12 +76,31 @@ func (p *process) start() error {
 	}
 
 	// Create context before building command (needed for CommandContext)
-	p.ctx, p.cancel = context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	p.ctx, p.cancel = ctx, cancel
+
+	// Until Start succeeds, this attempt owns cleanup. Track only resources
+	// acquired here, never stale pipes or a context from an earlier generation.
+	started := false
+	loggerCreated := false
+	var startupPipes []io.Closer
+	defer func() {
+		if !started {
+			cancel()
+			for _, pipe := range startupPipes {
+				_ = pipe.Close()
+			}
+			if loggerCreated {
+				p.instance.logger.close()
+			}
+		}
+	}()
 
 	// Create log files
 	if err := p.instance.logger.create(); err != nil {
 		return fmt.Errorf("failed to create log files: %w", err)
 	}
+	loggerCreated = true
 
 	// Build command using backend-specific methods
 	cmd, cmdErr := p.buildCommand()
@@ -94,10 +125,6 @@ func (p *process) start() error {
 		deadline := time.Now().Add(15 * time.Second)
 		for portInUse(host, port) {
 			if time.Now().After(deadline) {
-				p.instance.logger.close()
-				if p.cancel != nil {
-					p.cancel()
-				}
 				return fmt.Errorf("port %d is still occupied by a surviving process; refusing to start a second server on it", port)
 			}
 			log.Printf("Instance %s: port %d still in use, waiting for it to be released...", p.instance.Name, port)
@@ -107,27 +134,28 @@ func (p *process) start() error {
 
 	setProcAttrs(p.cmd)
 
-	var err error
 	p.stdin, err = p.cmd.StdinPipe()
 	if err != nil {
-		p.instance.logger.close()
 		return fmt.Errorf("failed to get stdin pipe: %w", err)
 	}
+	// Pipe methods attach the child end to cmd. If a later pipe fails before
+	// Start is called, exec cannot close either end for us.
+	startupPipes = append(startupPipes, p.stdin, p.cmd.Stdin.(io.Closer))
 	p.stdout, err = p.cmd.StdoutPipe()
 	if err != nil {
-		p.instance.logger.close()
 		return fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
+	startupPipes = append(startupPipes, p.stdout, p.cmd.Stdout.(io.Closer))
 	p.stderr, err = p.cmd.StderrPipe()
 	if err != nil {
-		p.stdout.Close()
-		p.instance.logger.close()
 		return fmt.Errorf("failed to get stderr pipe: %w", err)
 	}
+	startupPipes = append(startupPipes, p.stderr, p.cmd.Stderr.(io.Closer))
 
 	if err := p.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start instance %s: %w", p.instance.Name, err)
 	}
+	started = true
 
 	p.instance.SetStatus(Running)
 
@@ -246,6 +274,11 @@ func (p *process) stop() error {
 
 // restart manually restarts the process (resets restart counter)
 func (p *process) restart() error {
+	prepared, err := p.instance.PrepareOptions(p.instance.GetOptions())
+	if err != nil {
+		return fmt.Errorf("prepare restart: %w", err)
+	}
+	defer prepared.Close()
 	// Stop the process first
 	if err := p.stop(); err != nil {
 		// If it's not running, that's ok - we'll just start it
@@ -254,6 +287,9 @@ func (p *process) restart() error {
 		}
 	}
 
+	if err := prepared.Commit(); err != nil {
+		return fmt.Errorf("commit restart (instance stopped): %w", err)
+	}
 	// Reset restart counter for manual restart
 	p.mu.Lock()
 	p.restarts = 0
@@ -276,14 +312,18 @@ func (p *process) waitForHealthy(timeout int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	// Get host/port from instance
-	host := p.instance.options.GetHost()
-	port := p.instance.options.GetPort()
-	healthURL := fmt.Sprintf("http://%s:%d%s", host, port, p.instance.GetHealthPath())
+	// Keep target and credential from the same options generation throughout
+	// polling; an update must not send its new key to the previous target.
+	opts := p.instance.GetOptions()
+	host := opts.BackendOptions.GetHost()
+	port := opts.BackendOptions.GetPort()
+	key := p.instance.backendAPIKey(opts)
+	healthURL := "http://" + net.JoinHostPort(host, fmt.Sprint(port)) + opts.BackendOptions.GetHealthPath(p.instance.globalBackendSettings)
 
 	// Create a dedicated HTTP client for health checks
 	client := &http.Client{
-		Timeout: 5 * time.Second, // 5 second timeout per request
+		Timeout:       5 * time.Second, // 5 second timeout per request
+		CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 	}
 
 	// Helper function to check health directly
@@ -293,6 +333,9 @@ func (p *process) waitForHealthy(timeout int) error {
 			return false
 		}
 
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return false
@@ -475,9 +518,6 @@ func (p *process) handleAutoRestart(err error) {
 // buildCommand builds the command to execute using backend-specific logic
 func (p *process) buildCommand() (*exec.Cmd, error) {
 
-	// Build the environment variables
-	env := p.instance.buildEnvironment()
-
 	// Get the command to execute
 	command := p.instance.getCommand()
 	if command == "" {
@@ -490,20 +530,15 @@ func (p *process) buildCommand() (*exec.Cmd, error) {
 	// Create the exec.Cmd
 	cmd := exec.CommandContext(p.ctx, command, args...)
 
-	// Start with host environment variables
-	cmd.Env = os.Environ()
-
-	// Add/override with backend-specific environment variables
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-	}
+	// Environment policy applies only to this child, never to the parent.
+	cmd.Env = p.instance.childEnvironment()
 
 	return cmd, nil
 }
 
 // portInUse reports whether something is accepting TCP connections on host:port.
 func portInUse(host string, port int) bool {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", host, port), 500*time.Millisecond)
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprint(port)), 500*time.Millisecond)
 	if err != nil {
 		return false
 	}

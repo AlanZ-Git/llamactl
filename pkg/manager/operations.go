@@ -6,7 +6,6 @@ import (
 	"llamactl/pkg/backends"
 	"llamactl/pkg/instance"
 	"llamactl/pkg/validation"
-	"log"
 	"slices"
 	"strings"
 )
@@ -14,20 +13,23 @@ import (
 type MaxRunningInstancesError error
 
 // updateLocalInstanceFromRemote updates the local stub instance with data from the remote instance
-func (im *instanceManager) updateLocalInstanceFromRemote(localInst *instance.Instance, remoteInst *instance.Instance) {
+func (im *instanceManager) updateLocalInstanceFromRemote(localInst *instance.Instance, remoteInst *instance.Instance) error {
 	if localInst == nil || remoteInst == nil {
-		return
+		return nil
 	}
 
 	remoteOptions := remoteInst.GetOptions()
 	if remoteOptions == nil {
-		return
+		return nil
 	}
 
 	// Update the local instance with all remote data
-	localInst.SetOptions(remoteOptions)
+	if err := localInst.SetOptions(remoteOptions); err != nil {
+		return fmt.Errorf("prepare remote snapshot: %w", err)
+	}
 	localInst.SetStatus(remoteInst.GetStatus())
 	localInst.Created = remoteInst.Created
+	return nil
 }
 
 // ListInstances returns a list of all instances managed by the instance manager.
@@ -46,7 +48,9 @@ func (im *instanceManager) ListInstances() ([]*instance.Instance, error) {
 			}
 
 			// Update the local stub with all remote data (preserving Nodes)
-			im.updateLocalInstanceFromRemote(inst, remoteInst)
+			if err := im.updateLocalInstanceFromRemote(inst, remoteInst); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -56,11 +60,21 @@ func (im *instanceManager) ListInstances() ([]*instance.Instance, error) {
 // CreateInstance creates a new instance with the given options and returns it.
 // The instance is initially in a "stopped" state.
 func (im *instanceManager) CreateInstance(name string, options *instance.Options) (*instance.Instance, error) {
+	lock := im.lockInstance(name)
+	lock.Lock()
+	defer lock.Unlock()
 	if options == nil {
 		return nil, fmt.Errorf("instance options cannot be nil")
 	}
 
-	err := options.BackendOptions.ValidateInstanceOptions()
+	options, err := options.Clone()
+	if err != nil {
+		return nil, err
+	}
+	if err := options.ValidateEnvironmentPolicy(im.globalConfig); err != nil {
+		return nil, fmt.Errorf("prepare environment: %w", err)
+	}
+	err = options.BackendOptions.ValidateInstanceOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -101,10 +115,15 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 
 		// Create a local stub that preserves the Nodes field for tracking
 		// We keep the original options (with Nodes) so IsRemote() works correctly
-		inst := instance.New(name, im.globalConfig, options, nil)
+		inst, err := instance.NewChecked(name, im.globalConfig, options, nil)
+		if err != nil {
+			return nil, fmt.Errorf("prepare remote instance: %w", err)
+		}
 
 		// Update the local stub with all remote data (preserving Nodes)
-		im.updateLocalInstanceFromRemote(inst, remoteInst)
+		if err := im.updateLocalInstanceFromRemote(inst, remoteInst); err != nil {
+			return nil, err
+		}
 
 		// Map instance to node
 		if err := im.remote.setInstanceNode(name, nodeName); err != nil {
@@ -162,7 +181,11 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 		im.onStatusChange(name, oldStatus, newStatus)
 	}
 
-	inst := instance.New(name, im.globalConfig, options, statusCallback)
+	inst, err := instance.NewChecked(name, im.globalConfig, options, statusCallback)
+	if err != nil {
+		im.ports.release(allocatedPort)
+		return nil, fmt.Errorf("prepare instance: %w", err)
+	}
 
 	// Add to registry
 	if err := im.registry.add(inst); err != nil {
@@ -171,9 +194,10 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 		return nil, fmt.Errorf("failed to add instance to registry: %w", err)
 	}
 
-	// Persist instance (best-effort, don't fail if persistence fails)
 	if err := im.persistInstance(inst); err != nil {
-		log.Printf("Warning: failed to persist instance %s: %v", name, err)
+		im.registry.remove(name)
+		im.ports.release(allocatedPort)
+		return nil, fmt.Errorf("persist created instance (preset may already be committed): %w", err)
 	}
 
 	return inst, nil
@@ -208,7 +232,9 @@ func (im *instanceManager) GetInstance(name string) (*instance.Instance, error) 
 		}
 
 		// Update the local stub with all remote data (preserving Nodes)
-		im.updateLocalInstanceFromRemote(inst, remoteInst)
+		if err := im.updateLocalInstanceFromRemote(inst, remoteInst); err != nil {
+			return nil, err
+		}
 
 		// Return the local stub (preserving Nodes field)
 		return inst, nil
@@ -234,7 +260,9 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 		}
 
 		// Update the local stub with all remote data (preserving Nodes)
-		im.updateLocalInstanceFromRemote(inst, remoteInst)
+		if err := im.updateLocalInstanceFromRemote(inst, remoteInst); err != nil {
+			return nil, err
+		}
 
 		// Persist the updated remote instance locally
 		if err := im.persistInstance(inst); err != nil {
@@ -248,7 +276,14 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 		return nil, fmt.Errorf("instance options cannot be nil")
 	}
 
-	err := options.BackendOptions.ValidateInstanceOptions()
+	options, err := options.Clone()
+	if err != nil {
+		return nil, err
+	}
+	if err := options.ValidateEnvironmentPolicy(im.globalConfig); err != nil {
+		return nil, fmt.Errorf("prepare environment: %w", err)
+	}
+	err = options.BackendOptions.ValidateInstanceOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +303,7 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 	var allocatedPort int
 
 	if newPort != oldPort {
-		// Port is changing - need to release old and allocate new
+		// Reserve the candidate port without releasing the old one.
 		if newPort == 0 {
 			// Auto-allocate new port
 			allocatedPort, err = im.ports.allocate(name)
@@ -283,16 +318,20 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 			}
 			allocatedPort = newPort
 		}
-
-		// Release old port
-		if oldPort > 0 {
-			if err := im.ports.release(oldPort); err != nil {
-				// Rollback new port allocation
-				im.ports.release(allocatedPort)
-				return nil, fmt.Errorf("failed to release old port %d: %w", oldPort, err)
-			}
-		}
 	}
+
+	// Keep both reservations until the stopped-stage commit succeeds.
+	committed := false
+	defer func() {
+		if !committed && allocatedPort > 0 {
+			im.ports.release(allocatedPort)
+		}
+	}()
+	prepared, err := inst.PrepareOptions(options)
+	if err != nil {
+		return nil, fmt.Errorf("prepare update: %w", err)
+	}
+	defer prepared.Close()
 
 	// Check if instance is running before updating options
 	wasRunning := inst.IsRunning()
@@ -304,8 +343,16 @@ func (im *instanceManager) UpdateInstance(name string, options *instance.Options
 		}
 	}
 
-	// Now update the options while the instance is stopped
-	inst.SetOptions(options)
+	// Now commit the prepared preset and options while stopped.
+	if err := prepared.Commit(); err != nil {
+		return nil, fmt.Errorf("commit update (instance stopped): %w", err)
+	}
+	committed = true
+	if allocatedPort > 0 && oldPort > 0 {
+		if err := im.ports.release(oldPort); err != nil {
+			return nil, fmt.Errorf("release old port after commit: %w", err)
+		}
+	}
 
 	// If it was running before, start it again with the new options
 	if wasRunning {
@@ -396,7 +443,9 @@ func (im *instanceManager) StartInstance(name string) (*instance.Instance, error
 		}
 
 		// Update the local stub with all remote data (preserving Nodes)
-		im.updateLocalInstanceFromRemote(inst, remoteInst)
+		if err := im.updateLocalInstanceFromRemote(inst, remoteInst); err != nil {
+			return nil, err
+		}
 
 		return inst, nil
 	}
@@ -415,9 +464,9 @@ func (im *instanceManager) StartInstance(name string) (*instance.Instance, error
 		return nil, fmt.Errorf("failed to start instance %s: %w", name, err)
 	}
 
-	// Persist instance (best-effort, don't fail if persistence fails)
+	// The process state has changed; persistence failure is not success.
 	if err := im.persistInstance(inst); err != nil {
-		log.Printf("Warning: failed to persist instance %s: %v", name, err)
+		return nil, fmt.Errorf("persist instance %s after process change: %w", name, err)
 	}
 
 	return inst, nil
@@ -455,7 +504,9 @@ func (im *instanceManager) StopInstance(name string) (*instance.Instance, error)
 		}
 
 		// Update the local stub with all remote data (preserving Nodes)
-		im.updateLocalInstanceFromRemote(inst, remoteInst)
+		if err := im.updateLocalInstanceFromRemote(inst, remoteInst); err != nil {
+			return nil, err
+		}
 
 		return inst, nil
 	}
@@ -474,9 +525,9 @@ func (im *instanceManager) StopInstance(name string) (*instance.Instance, error)
 		return nil, fmt.Errorf("failed to stop instance %s: %w", name, err)
 	}
 
-	// Persist instance (best-effort, don't fail if persistence fails)
+	// The process state has changed; persistence failure is not success.
 	if err := im.persistInstance(inst); err != nil {
-		log.Printf("Warning: failed to persist instance %s: %v", name, err)
+		return nil, fmt.Errorf("persist instance %s after process change: %w", name, err)
 	}
 
 	return inst, nil
@@ -498,7 +549,9 @@ func (im *instanceManager) RestartInstance(name string) (*instance.Instance, err
 		}
 
 		// Update the local stub with all remote data (preserving Nodes)
-		im.updateLocalInstanceFromRemote(inst, remoteInst)
+		if err := im.updateLocalInstanceFromRemote(inst, remoteInst); err != nil {
+			return nil, err
+		}
 
 		return inst, nil
 	}
@@ -508,21 +561,13 @@ func (im *instanceManager) RestartInstance(name string) (*instance.Instance, err
 	lock.Lock()
 	defer lock.Unlock()
 
-	// Stop the instance
-	if inst.IsRunning() {
-		if err := inst.Stop(); err != nil {
-			return nil, fmt.Errorf("failed to stop instance %s: %w", name, err)
-		}
-	}
-
-	// Start the instance
-	if err := inst.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start instance %s: %w", name, err)
+	if err := inst.Restart(); err != nil {
+		return nil, fmt.Errorf("restart instance %s: %w", name, err)
 	}
 
 	// Persist the restarted instance
 	if err := im.persistInstance(inst); err != nil {
-		log.Printf("Warning: failed to persist instance %s: %v", name, err)
+		return nil, fmt.Errorf("persist restarted instance %s: %w", name, err)
 	}
 
 	return inst, nil

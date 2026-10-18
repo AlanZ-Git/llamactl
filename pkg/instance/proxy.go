@@ -2,9 +2,11 @@ package instance
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,7 +29,8 @@ type proxy struct {
 	instance *Instance
 
 	targetURL *url.URL
-	apiKey    string // For remote instances
+	apiKey    string // Remote node key or explicit local backend key
+	isolated  bool
 
 	responseHeaders map[string]string
 
@@ -83,16 +86,18 @@ func newProxy(instance *Instance) (*proxy, error) {
 		p.apiKey = node.APIKey
 	} else {
 		// Get host/port from process
-		host := p.instance.options.GetHost()
-		port := p.instance.options.GetPort()
+		host := options.BackendOptions.GetHost()
+		port := options.BackendOptions.GetPort()
 		if port == 0 {
 			return nil, fmt.Errorf("instance %s has no port assigned", p.instance.Name)
 		}
-		p.targetURL, err = url.Parse(fmt.Sprintf("http://%s:%d", host, port))
+		p.targetURL, err = url.Parse("http://" + net.JoinHostPort(host, strconv.Itoa(port)))
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse target URL for instance %s: %w", p.instance.Name, err)
 		}
 
+		p.apiKey = instance.backendAPIKey(options)
+		p.isolated = options.EnvironmentPolicy == "isolated"
 		// Get response headers from backend config
 		p.responseHeaders = options.BackendOptions.GetResponseHeaders(p.instance.globalBackendSettings)
 	}
@@ -104,6 +109,8 @@ func newProxy(instance *Instance) (*proxy, error) {
 // get returns the reverse proxy for this instance, creating it if needed.
 // Uses sync.Once to ensure thread-safe one-time initialization.
 func (p *proxy) get() (*httputil.ReverseProxy, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	// sync.Once guarantees buildProxy() is called exactly once
 	// Other callers block until first initialization completes
 	p.proxyOnce.Do(func() {
@@ -116,7 +123,15 @@ func (p *proxy) get() (*httputil.ReverseProxy, error) {
 // build creates the reverse proxy based on instance options
 func (p *proxy) build() (*httputil.ReverseProxy, error) {
 
-	proxy := httputil.NewSingleHostReverseProxy(p.targetURL)
+	// Capture one immutable routing/auth snapshot for this proxy generation.
+	current, err := newProxy(p.instance)
+	if err != nil {
+		return nil, err
+	}
+	remote := p.instance.IsRemote()
+	key := current.apiKey
+	isolated := current.isolated
+	proxy := httputil.NewSingleHostReverseProxy(current.targetURL)
 
 	// Modify the request before sending it to the backend
 	originalDirector := proxy.Director
@@ -124,8 +139,10 @@ func (p *proxy) build() (*httputil.ReverseProxy, error) {
 		originalDirector(req)
 
 		// Add API key header for remote instances
-		if p.instance.IsRemote() && p.apiKey != "" {
-			req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		} else if isolated && !remote {
+			req.Header.Del("Authorization")
 		}
 
 		// Update last request time (including health checks)
@@ -144,7 +161,7 @@ func (p *proxy) build() (*httputil.ReverseProxy, error) {
 			resp.Header.Del("Access-Control-Max-Age")
 			resp.Header.Del("Access-Control-Expose-Headers")
 
-			for key, value := range p.responseHeaders {
+			for key, value := range current.responseHeaders {
 				resp.Header.Set(key, value)
 			}
 			return nil

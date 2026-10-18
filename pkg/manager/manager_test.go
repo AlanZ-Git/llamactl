@@ -212,9 +212,10 @@ func createTestAppConfig(instancesDir string) *config.AppConfig {
 			TimeoutCheckInterval: 5,
 		},
 		Database: config.DatabaseConfig{
-			Path:               ":memory:",
-			MaxOpenConnections: 25,
-			MaxIdleConnections: 5,
+			Path: ":memory:",
+			// Each SQLite :memory: connection has a separate database.
+			MaxOpenConnections: 1,
+			MaxIdleConnections: 1,
 			ConnMaxLifetime:    5 * time.Minute,
 		},
 		LocalNode: "main",

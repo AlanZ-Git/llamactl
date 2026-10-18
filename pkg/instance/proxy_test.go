@@ -5,7 +5,7 @@ import (
 	"llamactl/pkg/config"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -39,25 +39,32 @@ func TestProxy_HealthRequestsExcluded(t *testing.T) {
 		inst := New("test-instance", globalConfig, options, nil)
 		p := inst.proxy
 		initialLastRequest := p.getLastRequestTime()
-		
+
 		req := httptest.NewRequest("GET", "/v1/chat/completions", nil)
 		w := httptest.NewRecorder()
-		
+
 		backendDone := make(chan struct{})
 		backendBlock := make(chan struct{})
-		
+
 		blockingBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			backendDone <- struct{}{}
 			<-backendBlock
 			w.WriteHeader(http.StatusOK)
 		}))
 		defer blockingBackend.Close()
-		
-		bu, _ := url.Parse(blockingBackend.URL)
-		p.mu.Lock()
-		p.targetURL = bu
-		p.mu.Unlock()
-		p.clear()
+
+		candidate, err := inst.GetOptions().Clone()
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate.BackendOptions.LlamaServerOptions.Host = "127.0.0.1"
+		candidate.BackendOptions.LlamaServerOptions.Port, err = strconv.Atoi(blockingBackend.URL[len("http://127.0.0.1:"):])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := inst.SetOptions(candidate); err != nil {
+			t.Fatal(err)
+		}
 
 		go func() {
 			p.serveHTTP(w, req)
@@ -68,18 +75,18 @@ func TestProxy_HealthRequestsExcluded(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("Timeout waiting for backend to be reached")
 		}
-		
+
 		if p.getInflightRequests() != 1 {
 			t.Errorf("Expected 1 inflight request, got %d", p.getInflightRequests())
 		}
-		
+
 		backendBlock <- struct{}{}
 		time.Sleep(50 * time.Millisecond)
-		
+
 		if p.getInflightRequests() != 0 {
 			t.Errorf("Expected 0 inflight requests after completion, got %d", p.getInflightRequests())
 		}
-		
+
 		if p.getLastRequestTime() <= initialLastRequest {
 			t.Errorf("Expected last request time to be updated")
 		}
@@ -90,26 +97,33 @@ func TestProxy_HealthRequestsExcluded(t *testing.T) {
 		p := inst.proxy
 		p.lastRequestTime.Store(0)
 		initialLastRequest := p.getLastRequestTime()
-		
+
 		backendDone := make(chan struct{})
 		backendBlock := make(chan struct{})
-		
+
 		blockingBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			backendDone <- struct{}{}
 			<-backendBlock
 			w.WriteHeader(http.StatusOK)
 		}))
 		defer blockingBackend.Close()
-		
-		bu, _ := url.Parse(blockingBackend.URL)
-		p.mu.Lock()
-		p.targetURL = bu
-		p.mu.Unlock()
-		p.clear()
+
+		candidate, err := inst.GetOptions().Clone()
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidate.BackendOptions.LlamaServerOptions.Host = "127.0.0.1"
+		candidate.BackendOptions.LlamaServerOptions.Port, err = strconv.Atoi(blockingBackend.URL[len("http://127.0.0.1:"):])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := inst.SetOptions(candidate); err != nil {
+			t.Fatal(err)
+		}
 
 		req := httptest.NewRequest("GET", "/health", nil)
 		w := httptest.NewRecorder()
-		
+
 		go func() {
 			p.serveHTTP(w, req)
 		}()
@@ -119,14 +133,14 @@ func TestProxy_HealthRequestsExcluded(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("Timeout waiting for backend to be reached")
 		}
-		
+
 		if p.getInflightRequests() != 0 {
 			t.Errorf("Expected 0 inflight requests for health check, got %d", p.getInflightRequests())
 		}
-		
+
 		backendBlock <- struct{}{}
 		time.Sleep(50 * time.Millisecond)
-		
+
 		if p.getLastRequestTime() <= initialLastRequest {
 			t.Errorf("Expected last request time to be updated for health check (dashboard use case)")
 		}

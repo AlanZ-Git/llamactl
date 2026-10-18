@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -34,14 +33,39 @@ type Instance struct {
 	logger  *logger  `json:"-"`
 }
 
-// New creates a new instance with the given name, log path, options and local node name
+// New is the legacy convenience constructor. Production paths use NewChecked.
+// It panics on invalid configuration or failed preparation rather than returning
+// an instance whose derived preset does not match its options.
 func New(name string, globalConfig *config.AppConfig, opts *Options, onStatusChange func(oldStatus, newStatus Status)) *Instance {
+	inst, err := NewChecked(name, globalConfig, opts, onStatusChange)
+	if err != nil {
+		panic(err)
+	}
+	return inst
+}
+
+// NewChecked creates an instance only after its configuration and preset are ready.
+func NewChecked(name string, globalConfig *config.AppConfig, opts *Options, onStatusChange func(oldStatus, newStatus Status)) (*Instance, error) {
+	if globalConfig == nil {
+		return nil, fmt.Errorf("instance configuration cannot be nil")
+	}
+	candidate, err := opts.Clone()
+	if err != nil {
+		return nil, fmt.Errorf("prepare instance options: %w", err)
+	}
+	opts = candidate
 
 	globalInstanceSettings := &globalConfig.Instances
 	globalBackendSettings := &globalConfig.Backends
 	globalNodesConfig := globalConfig.Nodes
 	localNodeName := globalConfig.LocalNode
 
+	if err := opts.ValidateEnvironmentPolicy(globalConfig); err != nil {
+		return nil, fmt.Errorf("prepare environment: %w", err)
+	}
+	if err := opts.BackendOptions.ValidateInstanceOptions(); err != nil {
+		return nil, fmt.Errorf("prepare backend: %w", err)
+	}
 	// Validate and copy options
 	opts.validateAndApplyDefaults(name, globalInstanceSettings)
 
@@ -64,7 +88,6 @@ func New(name string, globalConfig *config.AppConfig, opts *Options, onStatusCha
 		status:                 status,
 	}
 
-	var err error
 	instance.proxy, err = newProxy(instance)
 	if err != nil {
 		log.Println("Warning: Failed to create proxy for instance", instance.Name, "-", err)
@@ -85,37 +108,11 @@ func New(name string, globalConfig *config.AppConfig, opts *Options, onStatusCha
 		instance.process = newProcess(instance)
 
 		if err := syncPresetIni(name, opts, globalInstanceSettings.InstancesDir); err != nil {
-			log.Printf("Warning: Failed to write preset.ini for instance %s: %v", name, err)
+			return nil, fmt.Errorf("prepare instance preset: %w", err)
 		}
 	}
 
-	return instance
-}
-
-// syncPresetIni keeps the preset.ini file in sync with options:
-// written when a preset is set, removed when it is cleared
-func syncPresetIni(name string, opts *Options, instancesDir string) error {
-	if opts == nil || opts.PresetIni == nil || *opts.PresetIni == "" {
-		// A stale file would still be handed to the backend via --models-preset
-		presetPath := filepath.Join(instancesDir, name, "preset.ini")
-		if err := os.Remove(presetPath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("failed to remove preset.ini: %w", err)
-		}
-		return nil
-	}
-
-	instanceDir := filepath.Join(instancesDir, name)
-	if err := os.MkdirAll(instanceDir, 0755); err != nil {
-		return fmt.Errorf("failed to create instance directory: %w", err)
-	}
-
-	presetPath := filepath.Join(instanceDir, "preset.ini")
-	if err := os.WriteFile(presetPath, []byte(*opts.PresetIni), 0644); err != nil {
-		return fmt.Errorf("failed to write preset.ini: %w", err)
-	}
-
-	log.Printf("Wrote preset.ini for instance %s at %s", name, presetPath)
-	return nil
+	return instance, nil
 }
 
 // Start starts the instance
@@ -190,34 +187,13 @@ func (i *Instance) IsRunning() bool {
 }
 
 // SetOptions sets the options
-func (i *Instance) SetOptions(opts *Options) {
-	if opts == nil {
-		log.Println("Warning: Attempted to set nil options on instance", i.Name)
-		return
+func (i *Instance) SetOptions(opts *Options) error {
+	prepared, err := i.PrepareOptions(opts)
+	if err != nil {
+		return err
 	}
-
-	// Preserve the original nodes to prevent changing instance location
-	if i.options != nil && i.options.get() != nil {
-		opts.Nodes = i.options.get().Nodes
-	}
-
-	// Validate and copy options
-	opts.validateAndApplyDefaults(i.Name, i.globalInstanceSettings)
-
-	if i.options != nil {
-		i.options.set(opts)
-	}
-
-	if !i.IsRemote() && i.globalInstanceSettings != nil {
-		if err := syncPresetIni(i.Name, opts, i.globalInstanceSettings.InstancesDir); err != nil {
-			log.Printf("Warning: Failed to sync preset.ini for instance %s: %v", i.Name, err)
-		}
-	}
-
-	// Clear the proxy so it gets recreated with new options
-	if i.proxy != nil {
-		i.proxy.clear()
-	}
+	defer prepared.Close()
+	return prepared.Commit()
 }
 
 // SetTimeProvider sets a custom time provider for testing

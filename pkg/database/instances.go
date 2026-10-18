@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"llamactl/pkg/instance"
-	"log"
 	"time"
 )
 
@@ -108,14 +107,12 @@ func (db *sqliteDB) GetAll(ctx context.Context) ([]*instance.Instance, error) {
 			&row.ID, &row.Name, &row.Status, &row.CreatedAt, &row.UpdatedAt, &row.OptionsJSON, &row.OwnerUserID,
 		)
 		if err != nil {
-			log.Printf("Failed to scan instance row: %v", err)
-			continue
+			return nil, fmt.Errorf("failed to scan instance row: %w", err)
 		}
 
 		inst, err := db.rowToInstance(&row)
 		if err != nil {
-			log.Printf("Failed to convert row to instance: %v", err)
-			continue
+			return nil, fmt.Errorf("failed to reconstruct persisted instance: %w", err)
 		}
 
 		instances = append(instances, inst)
@@ -287,9 +284,8 @@ func (db *sqliteDB) rowToInstance(row *instanceRow) (*instance.Instance, error) 
 		return nil, fmt.Errorf("failed to unmarshal instance: %w", err)
 	}
 
-	// The UnmarshalJSON doesn't handle BackendOptions and Nodes (they have json:"-" tags)
-	// So we need to explicitly set the options again to ensure they're properly set
-	inst.SetOptions(&opts)
+	// Options.UnmarshalJSON already reconstructs typed backends and node sets.
+	// Runtime/file preparation belongs to the manager's checked constructor.
 
 	return &inst, nil
 }

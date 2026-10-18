@@ -2727,6 +2727,9 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "environment_policy": {
+                    "type": "string"
+                },
                 "group": {
                     "description": "Instance group for hierarchical eviction",
                     "type": "string"

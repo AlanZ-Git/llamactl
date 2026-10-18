@@ -292,6 +292,8 @@ definitions:
           type: string
         description: Environment variables
         type: object
+      environment_policy:
+        type: string
       group:
         description: Instance group for hierarchical eviction
         type: string

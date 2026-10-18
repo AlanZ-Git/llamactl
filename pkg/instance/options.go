@@ -23,7 +23,8 @@ type Options struct {
 	// Idle timeout
 	IdleTimeout *int `json:"idle_timeout,omitempty"` // minutes
 	// Environment variables
-	Environment map[string]string `json:"environment,omitempty"`
+	Environment       map[string]string `json:"environment,omitempty"`
+	EnvironmentPolicy string            `json:"environment_policy,omitempty"`
 	// Preset configuration
 	PresetIni *string `json:"preset_ini,omitempty"`
 
@@ -38,6 +39,22 @@ type Options struct {
 	Nodes map[string]struct{} `json:"-"`
 	// Backend options
 	BackendOptions backends.Options `json:"-"`
+}
+
+// Clone returns an independent candidate so preflight cannot mutate live options.
+func (c *Options) Clone() (*Options, error) {
+	if c == nil {
+		return nil, fmt.Errorf("instance options cannot be nil")
+	}
+	data, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	var result Options
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // options wraps Options with thread-safe access (unexported).
