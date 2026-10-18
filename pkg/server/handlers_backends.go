@@ -388,7 +388,7 @@ func (h *Handler) LlamaCppLoadModel() http.HandlerFunc {
 		}
 		if !inst.IsControlled() && !inst.IsRemote() && !inst.IsRunning() {
 			if err := h.ensureInstanceRunning(inst, perm.CanStart, perm.CanEvict, r); err != nil {
-				if !writeAdmissionError(w, err) {
+				if !writeAdmissionError(w, r, err) {
 					writeStartError(w, err)
 				}
 				return

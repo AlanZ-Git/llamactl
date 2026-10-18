@@ -76,8 +76,9 @@ unwinding. Two inference requests may overlap.
 Maintenance is exclusive: Update/Delete/Start/Stop/Restart, direct lifecycle and
 options APIs, prepared-option commits, and native Router load/unload all enter
 this boundary. A typed admission error maps to HTTP **409**, JSON
-`{"error":"busy","details":"..."}`, immediately when controlled use or
-maintenance is active. No queue, stop, preset preparation, port allocation or
+`{"error":"busy","details":"..."}`, without queueing when controlled use or
+maintenance is active. The HTTP/1 control-body cleanup below may precede delivery
+of that already-decided error. No queue, stop, preset preparation, port allocation or
 options replacement occurs on that busy path. Creation also reserves the name
 boundary and holds maintenance while publishing/persisting the instance. Deleted
 instances are retired so stale references cannot restart them.
@@ -103,7 +104,9 @@ shutdown; force/owner-stop semantics are deferred.
 ## Proxy policy
 
 All production proxy handlers eventually use `Instance.ServeHTTP`; rejection
-writes the response before returning an error (never an empty HTTP 200).
+writes the response before the HTTP handler returns (never an empty HTTP 200).
+For the maintenance routes below, a local rejection is deferred until the adapter's
+permits have unwound, then delivered by the enclosing HTTP boundary.
 
 * Controlled requests never auto-start. Stopped instances return HTTP **503**
   `instance_not_running` with use-running-only semantics, even for privileged
@@ -146,6 +149,72 @@ manager admission. Engine flags and behaviors require fixed-build integration
 validation before deployment; mock/local Go tests do not certify Windows/GPU,
 actual model readiness, autoload suppression in a particular engine build,
 or completion of engine work after a disconnected HTTP request.
+
+## Bounded HTTP/1 control-rejection settlement
+
+A server-side 409 log does not by itself prove that the client received the JSON.
+In particular, Go's automatic response-time request-body drain skips requests with
+`Connection: close`. The production router therefore settles **only local
+`busy` / `ai_paused` admission rejections** on these maintenance entrypoints:
+
+* native POST `/api/v1/llama-cpp/{name}/models/{model}/load` and `/unload`;
+* exact POST `/models/load` and `/models/unload` through the instance raw proxy;
+* instance Create, Update, Delete, Start, Stop and Restart management routes.
+
+This is not broad request-draining middleware. Authentication still runs first;
+backend responses (including backend 409s), unrelated errors, arbitrary proxy
+paths, uploads, inference and HTTP/2 do not opt into settlement. The existing
+status, business code, details and `retryable: false` fields are unchanged.
+Owner pause still allows unload/stop according to the existing admission rules.
+
+The route boundary defers only the already-decided rejection response. The
+handler and its normal defers finish **before any cleanup read**, so no rejected
+request's instance lock, maintenance lease or owner permit is retained while
+waiting for the client. Cleanup never retries admission or invokes the backend.
+Successful requests do not have their writer/body wrapped, buffered or pre-read;
+ordinary decoding, original proxy bytes and SSE forwarding/permit lifetime remain
+unchanged. Create/Update still decode before admission: this cleanup does not
+bound their existing initial decoder work or change invalid-body precedence.
+
+Cleanup budgets and fallback:
+
+* Only known-length, non-chunked bodies of **at most 4 KiB**, with no `Expect`
+  header, qualify. This comfortably covers small model-name controls without
+  turning cleanup into a large configuration/upload drain. The declared length
+  includes all whitespace. It is a cleanup threshold, **not** a new accepted-body
+  limit or a change to the controlled proxy's existing 16 MiB validation limit.
+* Additional application reads discard at most the declared length (and never
+  more than 4 KiB), using a fixed buffer and one absolute **100 ms read deadline**.
+  The deadline is not renewed by trickle traffic. There is no background reader,
+  goroutine race, unbounded `ReadAll`, or application call to `Body.Close`.
+* Complete small bodies are consumed before writing the original error, even for
+  `Connection: close`. Successful cleanup clears its read deadline; keep-alive and
+  already-pipelined requests may continue under normal server timeout handling.
+* Unknown/chunked/oversized/expect-continue bodies and unavailable read deadlines
+  cause **zero cleanup reads**. Cancellation, no progress, truncation, disconnect,
+  timeout or a failed deadline reset also select the close fallback. Rejection
+  remains side-effect free; delivery is not guaranteed for these fallback cases.
+* Fallback emits the same JSON with close-delimited HTTP/1 framing, requests
+  `Connection: close`, bounds the final flush with a 100 ms write deadline when
+  supported, then hijacks and closes the HTTP/1 connection. Merely setting the
+  response's close header is insufficient: Go's `finishRequest` can still call
+  the original body's `Close` and drain up to another 256 KiB. Explicit connection
+  teardown avoids that extra read/close and prevents unsafe connection reuse.
+
+The native Go HTTP/1 writer supports deadlines, flush and hijack; wrappers must
+preserve those capabilities directly or through `Unwrap() http.ResponseWriter`
+(as the production logging chain does). A custom/opaque writer exposing neither
+transport deadlines nor hijack receives a close response without any application
+body read/close; its host must provide bounded connection teardown. No helper can
+impose transport deadlines through a writer that hides all transport access.
+This integration limitation is not a reason to drain without a deadline.
+
+Local regressions cover exact consumption and byte/time boundaries, unsupported
+writers, incomplete/trickling/disconnected bodies, real loopback TCP close and
+keep-alive/pipelining, active SSE rejection and natural EOF release, owner pause,
+auth, decoder leftovers, and unchanged accepted slow/large bodies. These tests
+are portable Go fixtures, not proof of Windows socket behavior or real-model
+success. No RST initiator is inferred from application logs.
 
 ## Local verification boundaries
 

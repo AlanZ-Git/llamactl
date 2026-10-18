@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"llamactl/pkg/config"
 	"llamactl/pkg/database"
+	"llamactl/pkg/httpreject"
 	"llamactl/pkg/instance"
 	"llamactl/pkg/manager"
 	"llamactl/pkg/models"
@@ -50,10 +51,14 @@ func writeError(w http.ResponseWriter, status int, code, details string) {
 	}
 }
 
-func writeAdmissionError(w http.ResponseWriter, err error) bool {
+func writeAdmissionError(w http.ResponseWriter, r *http.Request, err error) bool {
 	status, code, ok := instance.AdmissionHTTPError(err)
 	if ok {
-		writeError(w, status, code, err.Error())
+		write := func() { writeError(w, status, code, err.Error()) }
+		if r != nil && (code == "busy" || code == "ai_paused") && httpreject.Defer(r, write) {
+			return true
+		}
+		write()
 	}
 	return ok
 }
@@ -236,7 +241,7 @@ func writeStartError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, code, err.Error())
 		return
 	}
-	if writeAdmissionError(w, err) {
+	if writeAdmissionError(w, nil, err) {
 		return
 	}
 	switch {

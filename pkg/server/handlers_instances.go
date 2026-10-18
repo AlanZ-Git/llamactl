@@ -27,7 +27,7 @@ func (h *Handler) ListInstances() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		instances, err := h.InstanceManager.ListInstances()
 		if err != nil {
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "list_failed", "Failed to list instances: "+err.Error())
@@ -68,7 +68,7 @@ func (h *Handler) CreateInstance() http.HandlerFunc {
 
 		inst, err := h.InstanceManager.CreateInstance(validatedName, &options)
 		if err != nil {
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "create_failed", "Failed to create instance: "+err.Error())
@@ -109,7 +109,7 @@ func (h *Handler) GetInstance() http.HandlerFunc {
 				writeError(w, http.StatusNotFound, "not_found", err.Error())
 				return
 			}
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "get_failed", "Failed to get instance: "+err.Error())
@@ -150,7 +150,7 @@ func (h *Handler) UpdateInstance() http.HandlerFunc {
 
 		inst, err := h.InstanceManager.UpdateInstance(validatedName, &options)
 		if err != nil {
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "update_failed", "Failed to update instance: "+err.Error())
@@ -183,7 +183,7 @@ func (h *Handler) StartInstance() http.HandlerFunc {
 
 		inst, err := h.InstanceManager.StartInstance(validatedName)
 		if err != nil {
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			// Check if error is due to maximum running instances limit
@@ -222,7 +222,7 @@ func (h *Handler) StopInstance() http.HandlerFunc {
 
 		inst, err := h.InstanceManager.StopInstance(validatedName)
 		if err != nil {
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "stop_failed", "Failed to stop instance: "+err.Error())
@@ -255,7 +255,7 @@ func (h *Handler) RestartInstance() http.HandlerFunc {
 
 		inst, err := h.InstanceManager.RestartInstance(validatedName)
 		if err != nil {
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "restart_failed", "Failed to restart instance: "+err.Error())
@@ -293,7 +293,7 @@ func (h *Handler) DeleteInstance() http.HandlerFunc {
 				writeError(w, http.StatusNotFound, "not_found", err.Error())
 				return
 			}
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "delete_failed", "Failed to delete instance: "+err.Error())
@@ -339,7 +339,7 @@ func (h *Handler) GetInstanceLogs() http.HandlerFunc {
 		// Use the instance manager which handles both local and remote instances
 		logs, err := h.InstanceManager.GetInstanceLogs(validatedName, numLines)
 		if err != nil {
-			if writeAdmissionError(w, err) {
+			if writeAdmissionError(w, r, err) {
 				return
 			}
 			writeError(w, http.StatusInternalServerError, "logs_failed", "Failed to get logs: "+err.Error())

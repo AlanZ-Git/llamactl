@@ -23,7 +23,7 @@ import (
 
 // A real manager, SQLite store, router, auth middleware and reverse proxy. Only
 // the native engine is replaced by an httptest server; no model is executed.
-func admissionServer(t *testing.T, backend http.Handler) (http.Handler, manager.InstanceManager, *instance.Instance, string) {
+func admissionServer(t *testing.T, backend http.Handler, inspect ...func(*Handler)) (http.Handler, manager.InstanceManager, *instance.Instance, string) {
 	t.Helper()
 	engine := httptest.NewServer(backend)
 	t.Cleanup(engine.Close)
@@ -61,7 +61,11 @@ func admissionServer(t *testing.T, backend http.Handler) (http.Handler, manager.
 	}
 	inst.SetStatus(instance.Running)
 	t.Cleanup(func() { inst.SetStatus(instance.Stopped) })
-	return SetupRouter(NewHandler(im, nil, cfg, db, nil)), im, inst, filepath.Join(cfg.Instances.InstancesDir, inst.Name, "preset.ini")
+	handler := NewHandler(im, nil, cfg, db, nil)
+	for _, f := range inspect {
+		f(handler)
+	}
+	return SetupRouter(handler), im, inst, filepath.Join(cfg.Instances.InstancesDir, inst.Name, "preset.ini")
 }
 
 func admittedRequest(method, path, body string) *http.Request {

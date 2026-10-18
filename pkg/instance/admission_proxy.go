@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"llamactl/pkg/httpreject"
 	"llamactl/pkg/resourcepolicy"
 	"net/http"
 	"strings"
@@ -71,7 +72,8 @@ func (i *Instance) CheckRequestPolicy(r *http.Request) error {
 // ReserveProxyRequest reserves owner-policy admission before an adapter's
 // optional autostart. It is not a forwarding bypass: ServeHTTP still validates
 // instance admission, request shape and this permit's epoch. Close after forwarding.
-// On failure the stable HTTP admission response has already been written.
+// On failure the stable HTTP admission response is written, or scheduled at the
+// enclosing control-rejection boundary after the adapter releases its permits.
 func (i *Instance) ReserveProxyRequest(w http.ResponseWriter, r *http.Request) (func(), error) {
 	access := classifyProxy(r)
 	if access == proxyRead || (access == proxyMaintenance && r.URL.Path == "/models/unload") {
@@ -227,13 +229,19 @@ func writeProxyError(w http.ResponseWriter, r *http.Request, err error) {
 	if code == "ai_paused" && classifyProxy(r) == proxyUse {
 		status = http.StatusServiceUnavailable
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	body := map[string]any{"error": code, "details": err.Error()}
-	if code == "ai_paused" {
-		body["retryable"] = false
+	write := func() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		body := map[string]any{"error": code, "details": err.Error()}
+		if code == "ai_paused" {
+			body["retryable"] = false
+		}
+		_ = json.NewEncoder(w).Encode(body)
 	}
-	_ = json.NewEncoder(w).Encode(body)
+	if (code == "busy" || code == "ai_paused") && classifyProxy(r) == proxyMaintenance && httpreject.Defer(r, write) {
+		return
+	}
+	write()
 }
 
 func (i *Instance) serveAdmitted(w http.ResponseWriter, r *http.Request) (err error) {
