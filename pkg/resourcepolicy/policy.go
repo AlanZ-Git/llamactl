@@ -1,9 +1,9 @@
-// Package resourcepolicy implements an owner-controlled new-work latch, not a
-// drain, process terminator, or proof of resource release.
+// Package resourcepolicy implements the owner admission latch and boot-local release intent.
 package resourcepolicy
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -18,23 +18,31 @@ import (
 var ErrPaused = errors.New("ai_paused: owner must resume AI; retryable=false")
 var ErrConflict = errors.New("resource policy boot_id or revision conflict")
 
-// Snapshot describes policy only. Even with no permits, blocked never means released.
+// Snapshot combines admission/persistence state with independently verified release.
 type Snapshot struct {
-	AllowAI   bool   `json:"allow_ai"`
-	Admission string `json:"admission"`
-	Durable   bool   `json:"durable"`
-	Release   string `json:"release"`
-	Revision  uint64 `json:"revision"`
-	BootID    string `json:"boot_id"`
+	AllowAI          bool              `json:"allow_ai"`
+	Admission        string            `json:"admission"`
+	Durable          bool              `json:"durable"`
+	Release          string            `json:"release"`
+	Revision         uint64            `json:"revision"`
+	BootID           string            `json:"boot_id"`
+	ReleaseOperation *ReleaseOperation `json:"release_operation,omitempty"`
 }
 
 type Gate struct {
-	mu      sync.Mutex
-	writeMu sync.Mutex
-	state   Snapshot
-	epoch   uint64
-	active  uint64
-	path    string
+	mu             sync.Mutex
+	writeMu        sync.Mutex
+	state          Snapshot
+	epoch          uint64
+	active         uint64
+	path           string
+	effects        chan struct{}
+	pendingEffects map[<-chan struct{}]struct{}
+	resuming       uint64
+	permits        map[*Permit]struct{}
+	releaseRunner  func(*ReleaseTicket)
+	releaseCurrent *ReleaseTicket
+	releaseIDs     map[string]*ReleaseTicket
 	// Immutable after construction; separated for deterministic I/O failure tests.
 	persist func(string, []byte) error
 }
@@ -44,7 +52,7 @@ type Gate struct {
 // Missing files default allowed but are not claimed durable until an explicit write.
 // Every read/parse error returns a usable BLOCKED gate as well as the error.
 func Open(dataDir string) (*Gate, error) {
-	g := &Gate{persist: replaceFile}
+	g := &Gate{persist: replaceFile, effects: make(chan struct{}, 1), permits: make(map[*Permit]struct{}), releaseIDs: make(map[string]*ReleaseTicket)}
 	var id [16]byte
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil, fmt.Errorf("policy boot identity: %w", err)
@@ -145,9 +153,18 @@ func DecodeObject(data []byte, names ...string) (map[string]json.RawMessage, err
 
 func (g *Gate) snapshotLocked() Snapshot {
 	s := g.state
-	s.Admission, s.Release = "allowed", "not_requested"
-	if !s.AllowAI {
-		s.Admission, s.Release = "blocked", "unreleased_unknown"
+	s.Admission = "allowed"
+	if s.AllowAI {
+		s.Release, s.ReleaseOperation = "not_requested", nil
+	} else {
+		s.Admission = "blocked"
+		if s.Release == "" {
+			s.Release = "unreleased_unknown"
+		}
+		if s.ReleaseOperation != nil {
+			op := *s.ReleaseOperation
+			s.ReleaseOperation = &op
+		}
 	}
 	return s
 }
@@ -166,8 +183,29 @@ func (g *Gate) Update(allow bool, boot string, revision uint64) (Snapshot, error
 	}
 	g.state.Revision++
 	current := g.state.Revision
+	g.resuming = 0
+	if allow {
+		g.resuming = current
+	}
+	defer func() {
+		g.mu.Lock()
+		if g.resuming == current {
+			g.resuming = 0
+		}
+		g.mu.Unlock()
+	}()
 	g.state.AllowAI, g.state.Durable = false, false
 	g.epoch++
+	for p := range g.permits {
+		if p.cancelOnPause {
+			p.cancel()
+		}
+	}
+	g.invalidateReleaseLocked()
+	g.state.Release, g.state.ReleaseOperation = "unreleased_unknown", nil
+	if !allow {
+		g.beginReleaseLocked(fmt.Sprintf("pause:%d", current), "graceful", false)
+	}
 	g.mu.Unlock()
 
 	g.writeMu.Lock()
@@ -179,6 +217,24 @@ func (g *Gate) Update(allow bool, boot string, revision uint64) (Snapshot, error
 		return s, ErrConflict
 	}
 	g.mu.Unlock()
+	if allow {
+		// Old tickets were revoked above. Join their synchronous syscall boundary
+		// before writing allowed. An unresolved cross-process dispatch fails closed
+		// without retaining effects or waiting indefinitely for the helper.
+		g.effects <- struct{}{}
+		g.mu.Lock()
+		pending := g.pendingEffectsLocked()
+		stale := current != g.state.Revision
+		s := g.snapshotLocked()
+		g.mu.Unlock()
+		<-g.effects
+		if stale {
+			return s, ErrConflict
+		}
+		if pending {
+			return s, ErrEffectPending
+		}
+	}
 	data, err := json.Marshal(struct {
 		Version  uint64 `json:"version"`
 		AllowAI  bool   `json:"allow_ai"`
@@ -186,6 +242,12 @@ func (g *Gate) Update(allow bool, boot string, revision uint64) (Snapshot, error
 	}{1, allow, current})
 	if err == nil && g.path != "" {
 		err = g.persist(g.path, append(data, '\n'))
+	}
+	// Reopening is ordered after any already-authorized OS signal/spawn, never
+	// after its process exit wait. Pause never acquires this boundary.
+	if allow {
+		g.effects <- struct{}{}
+		defer func() { <-g.effects }()
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -195,6 +257,12 @@ func (g *Gate) Update(allow bool, boot string, revision uint64) (Snapshot, error
 	if err != nil {
 		return g.snapshotLocked(), fmt.Errorf("persist resource policy: %w", err)
 	}
+	if allow {
+		if g.pendingEffectsLocked() {
+			return g.snapshotLocked(), ErrEffectPending
+		}
+		g.invalidateReleaseLocked()
+	}
 	g.state.AllowAI, g.state.Durable = allow, g.path != ""
 	return g.snapshotLocked(), nil
 }
@@ -203,9 +271,28 @@ func (g *Gate) Update(allow bool, boot string, revision uint64) (Snapshot, error
 // or forward boundary; a pause invalidates old permits even after owner resume.
 // No gate mutex is retained during caller work or I/O.
 type Permit struct {
-	gate   *Gate
-	epoch  uint64
-	closed bool
+	gate          *Gate
+	epoch         uint64
+	closed        bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	cancelOnPause bool
+	cleanup       bool
+}
+
+// CancelOnPause opts control/loading work into immediate cancellation on any
+// owner epoch change. Existing inference retains graceful-drain semantics.
+func (p *Permit) CancelOnPause() {
+	if p == nil {
+		return
+	}
+	g := p.gate
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	p.cancelOnPause = true
+	if p.closed || (!g.state.AllowAI && !p.cleanup) || p.epoch != g.epoch {
+		p.cancel()
+	}
 }
 
 func (g *Gate) Acquire() (*Permit, error) {
@@ -218,7 +305,10 @@ func (g *Gate) Acquire() (*Permit, error) {
 		return nil, ErrPaused
 	}
 	g.active++
-	return &Permit{gate: g, epoch: g.epoch}, nil
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &Permit{gate: g, epoch: g.epoch, ctx: ctx, cancel: cancel}
+	g.permits[p] = struct{}{}
+	return p, nil
 }
 func (p *Permit) Check() error {
 	if p == nil {
@@ -242,6 +332,8 @@ func (p *Permit) Close() {
 	if !p.closed {
 		p.closed = true
 		g.active--
+		delete(g.permits, p)
+		p.cancel()
 	}
 }
 

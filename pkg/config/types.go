@@ -88,6 +88,9 @@ type DatabaseConfig struct {
 
 // InstancesConfig contains instance management configuration
 type InstancesConfig struct {
+	// Finite control operations: zero selects 600 seconds and 1024 retained results.
+	ControlOperationTimeoutSeconds int `yaml:"control_operation_timeout_seconds,omitempty" json:"control_operation_timeout_seconds,omitempty"`
+	ControlOperationCapacity       int `yaml:"control_operation_capacity,omitempty" json:"control_operation_capacity,omitempty"`
 	// Port range for instances (e.g., 8000,9000)
 	PortRange [2]int `yaml:"port_range" json:"port_range"`
 

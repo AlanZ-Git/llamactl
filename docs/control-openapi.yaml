@@ -1,0 +1,528 @@
+openapi: 3.0.3
+info:
+  title: Llamactl finite Router control and deployment tests
+  version: p3c/1
+  description: >-
+    Additive instance control contract. A single local protocol-enabled llama.cpp
+    Router; not a task scheduler. GET has no engine/inference side effects.
+    Authentication is mandatory. See control-api.zh-CN.md for recovery and inference.
+security:
+  - bearerAuth: []
+  - apiKeyAuth: []
+paths:
+  /api/v1/instances/{name}/control:
+    parameters:
+      - $ref: '#/components/parameters/InstanceName'
+    get:
+      operationId: getControl
+      summary: Read capabilities, durable revision and last confirmed ready generation
+      responses:
+        '200':
+          description: Snapshot (not a live child-health measurement)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlSnapshot' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+    put:
+      operationId: recoverControl
+      summary: Administrator attests verified stopped state; never starts or replays
+      description: >-
+        Management key or administrator session only. Checks boot/revision, no active
+        use, owned tree/monitor exit, port availability and existing preset equality.
+        verified_stopped is an administrator attestation, not permission to kill an
+        unknown process. Does not clear owner pause. Handler budget is 5 seconds.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecoveryRequest' }
+      responses:
+        '200':
+          description: Verified stopped snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlSnapshot' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/v1/instances/{name}/operations:
+    parameters:
+      - $ref: '#/components/parameters/InstanceName'
+    post:
+      operationId: submitControl
+      summary: Admit or retrieve an idempotent bounded operation
+      description: >-
+        Maximum 64 KiB unencoded JSON. Duplicate keys, unknown fields, trailing JSON
+        and top-level nulls are rejected. Same scope/instance/boot/key and normalized
+        payload returns the original operation with 202, even after completion or
+        revision change. Different payload is 409. Default total deadline 600s;
+        caller may only shorten the advertised budget. No queue or force.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OperationRequest' }
+      responses:
+        '202':
+          description: Accepted or previously accepted operation; not ready/success
+          headers:
+            Location:
+              schema: { type: string }
+              description: Operation resource; repeat original POST if response was lost
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlOperation' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/v1/instances/{name}/operations/{id}:
+    parameters:
+      - $ref: '#/components/parameters/InstanceName'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getControlOperation
+      summary: Read own scope's operation (administrator may read any scope)
+      description: >-
+        Current-boot memory only. Terminal records retained for 24 hours after ended_at;
+        404 also covers another scope, expired records and lost boot history and is
+        never evidence that a command did not execute.
+      responses:
+        '200':
+          description: Current or terminal operation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ControlOperation' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/v1/instances/{name}/tests:
+    parameters:
+      - $ref: '#/components/parameters/InstanceName'
+    post:
+      operationId: submitDeploymentTest
+      summary: Run one bounded configuration with a fixed synthetic text fixture
+      description: >-
+        Same mandatory control authentication and fixed-instance scope. Maximum 64 KiB,
+        duplicate/unknown fields rejected. Same boot/scope/instance/key and canonical
+        payload returns the original record before CAS; different payload is 409.
+        Only one test is active per manager; generations are sequential without retries.
+        Defaults are 3 measured generations, no warmup, 256 output tokens, 600 seconds.
+        The deadline includes a cleanup reserve of min(5s, budget/2). No automatic replay.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeploymentTestRequest' }
+      responses:
+        '202':
+          description: Accepted or original run, not proof of success; independent of HTTP disconnect
+          headers:
+            Location:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeploymentTest' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '500': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/v1/instances/{name}/tests/{id}:
+    parameters:
+      - $ref: '#/components/parameters/InstanceName'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getDeploymentTest
+      summary: Read own test or export the same sanitized report
+      description: >-
+        Admins may diagnose any scope. Terminal records retained 24h in current-boot
+        bounded memory. 404 test_unknown_not_resumable includes wrong scope, expired
+        or restarted history; never proof that no work executed. No reads start work.
+        No prompts, replies, private paths, credentials or ready tokens are exported.
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [json, csv], default: json }
+      responses:
+        '200':
+          description: Live or terminal report; terminal means reservation unwound
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeploymentTest' }
+            text/csv:
+              schema: { type: string, description: 'field,value rows flatten the JSON report; null remains null; formula prefixes escaped' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+  /api/v1/instances/{name}/tests/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/InstanceName'
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: cancelDeploymentTest
+      summary: Idempotently cancel own run without blocking necessary owned cleanup
+      description: >-
+        Same scalar boot/CAS/key envelope. Repeating the same normalized cancellation
+        returns the current report before CAS. Cancellation keys are scoped to this
+        run and identity, at most 16 per run. First cancellation checks current instance
+        revision. Cancellation of a terminal run does not change its result. Owner pause
+        cancels even graceful runs; resume never replays them. 200 is not terminal proof.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeploymentCancelRequest' }
+      responses:
+        '200':
+          description: Current report; poll until ended_at is non-null
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeploymentTest' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+        '503': { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Scoped-controller or management key; ready token is not authentication
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  parameters:
+    InstanceName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Error:
+      description: Stable error code; no automatic retry/rollback. See protocol error table.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ControlError' }
+  schemas:
+    DeploymentCancelRequest:
+      type: object
+      additionalProperties: false
+      required: [boot_id, expected_revision, idempotency_key]
+      properties:
+        boot_id: { type: string, minLength: 1, maxLength: 128 }
+        expected_revision: { $ref: '#/components/schemas/Revision' }
+        idempotency_key: { $ref: '#/components/schemas/LogicalID' }
+    DeploymentTestRequest:
+      type: object
+      additionalProperties: false
+      required: [boot_id, expected_revision, idempotency_key, model, fixture_id]
+      properties:
+        boot_id: { type: string, minLength: 1, maxLength: 128 }
+        expected_revision: { $ref: '#/components/schemas/Revision' }
+        idempotency_key: { $ref: '#/components/schemas/LogicalID' }
+        model: { $ref: '#/components/schemas/LogicalID' }
+        fixture_id: { type: string, enum: [synthetic-text-v1] }
+        patch: { $ref: '#/components/schemas/ControlPatch' }
+        measured_generations: { type: integer, minimum: 1, maximum: 3, default: 3 }
+        warmup: { type: boolean, default: false }
+        max_output_tokens: { type: integer, minimum: 1, maximum: 256, default: 256 }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 600, default: 600 }
+        concurrency: { type: integer, enum: [1], default: 1 }
+        seed: { type: integer, minimum: 0, maximum: 2147483647, default: 0 }
+    DeploymentIdentity:
+      type: object
+      additionalProperties: false
+      required: [application_version, application_commit, application_build_time, source_modified, engine, engine_version, engine_hash, model_hash, runtime_identity]
+      properties:
+        application_version: { type: string }
+        application_commit: { type: string }
+        application_build_time: { type: string }
+        source_modified: { type: boolean, nullable: true }
+        engine: { type: string, enum: [llama_cpp] }
+        engine_version: { type: string, description: unknown unless trusted provenance is available; no executable inspection }
+        engine_hash: { type: string }
+        model_hash: { type: string, description: unknown; does not scan model files }
+        runtime_identity: { type: string }
+    GenerationObservation:
+      type: object
+      additionalProperties: false
+      required: [kind, started_at, duration_ms, ttft_ms, prompt_tokens, completion_tokens, backend_prefill_ms, backend_decode_ms, response_bytes, completed]
+      properties:
+        kind: { type: string, enum: [warmup, initial, subsequent] }
+        started_at: { type: string, format: date-time }
+        duration_ms: { type: number, minimum: 0 }
+        ttft_ms: { type: number, minimum: 0, nullable: true, description: Client observed first nonempty content delta; not role/reasoning/usage }
+        prompt_tokens: { type: integer, minimum: 0, nullable: true, description: Exact provider usage or null; never estimated }
+        completion_tokens: { type: integer, minimum: 0, nullable: true }
+        backend_prefill_ms: { type: number, minimum: 0, nullable: true }
+        backend_decode_ms: { type: number, minimum: 0, nullable: true }
+        response_bytes: { type: integer, minimum: 0, description: UTF-8 content bytes only; no response text retained }
+        completed: { type: boolean }
+        error_code: { type: string }
+    DeploymentResourceMetric:
+      type: object
+      additionalProperties: false
+      required: [value, unit, source, scope, available, sampled_at, sample_window_ms, stale]
+      properties:
+        value: { type: number, nullable: true }
+        unit: { type: string }
+        source: { type: string }
+        scope: { type: string }
+        available: { type: boolean }
+        reason: { type: string }
+        sampled_at: { type: string, format: date-time, nullable: true }
+        sample_window_ms: { type: integer, minimum: 0 }
+        stale: { type: boolean }
+    DeploymentMetric:
+      type: object
+      additionalProperties: false
+      required: [unit, source, scope, mean, observed_peak, observed, missing, stale, coverage, first_at, last_at]
+      properties:
+        unit: { type: string }
+        source: { type: string }
+        scope: { type: string }
+        mean: { type: number, nullable: true }
+        observed_peak: { type: number, nullable: true, description: Observed maximum; not a guaranteed transient peak }
+        observed: { type: integer, minimum: 0 }
+        missing: { type: integer, minimum: 0 }
+        stale: { type: integer, minimum: 0 }
+        coverage: { type: number, minimum: 0, maximum: 1, description: Valid distinct observations / distinct metric attempts; not time coverage }
+        first_at: { type: string, format: date-time, nullable: true }
+        last_at: { type: string, format: date-time, nullable: true }
+        reason: { type: string }
+    DeploymentResources:
+      type: object
+      additionalProperties: false
+      required: [source, baseline_at, baseline, metrics, distinct_snapshots, contention]
+      properties:
+        source: { type: string, enum: [shared_resource_cache] }
+        baseline_at: { type: string, format: date-time, nullable: true }
+        baseline:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/DeploymentResourceMetric' }
+        metrics:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/DeploymentMetric' }
+        distinct_snapshots: { type: integer, minimum: 0 }
+        gap: { type: string }
+        contention: { type: string, description: Annotation only; never attributes device load to one model or kills external apps }
+    DeploymentTest:
+      type: object
+      additionalProperties: false
+      required: [id, boot_id, instance, model, state, stage, started_at, deadline, ended_at, elapsed_ms, revision, process_generation, load_generation, parameters, parameter_defaults, identity, fixture_id, fixture_digest, measured_generations, warmup, max_output_tokens, seed, temperature, concurrency, attempted_generations, completed_measured, load_mode, cache_condition, cache_prompt_requested, ready_duration_ms, cleanup, cleanup_duration_ms, samples, resources]
+      properties:
+        id: { type: string }
+        boot_id: { type: string }
+        instance: { type: string }
+        model: { $ref: '#/components/schemas/LogicalID' }
+        state: { type: string, enum: [running, succeeded, partial, failed, cancelled] }
+        stage: { type: string }
+        error_code: { type: string }
+        error_stage: { type: string }
+        started_at: { type: string, format: date-time }
+        deadline: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time, nullable: true }
+        elapsed_ms: { type: number, minimum: 0 }
+        revision: { $ref: '#/components/schemas/Revision' }
+        process_generation: { type: integer, minimum: 0 }
+        load_generation: { type: integer, minimum: 0 }
+        parameters: { $ref: '#/components/schemas/ControlPatch' }
+        parameter_defaults: { type: string, description: Only configured effective overrides are known; omitted backend defaults are not measured }
+        identity: { $ref: '#/components/schemas/DeploymentIdentity' }
+        fixture_id: { type: string, enum: [synthetic-text-v1] }
+        fixture_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        measured_generations: { type: integer, minimum: 1, maximum: 3 }
+        warmup: { type: boolean }
+        max_output_tokens: { type: integer, minimum: 1, maximum: 256 }
+        seed: { type: integer, minimum: 0, maximum: 2147483647 }
+        temperature: { type: integer, enum: [0] }
+        concurrency: { type: integer, enum: [1] }
+        attempted_generations: { type: integer, minimum: 0, maximum: 4 }
+        completed_measured: { type: integer, minimum: 0, maximum: 3 }
+        load_mode: { type: string, enum: [test_owned, reused_ready] }
+        cache_condition: { type: string, enum: [unknown] }
+        cache_prompt_requested: { type: boolean, enum: [false], description: Requested false is not verified cache clearance }
+        ready_duration_ms: { type: number, minimum: 0, nullable: true }
+        cleanup: { type: string }
+        cleanup_error: { type: string }
+        cleanup_duration_ms: { type: number, minimum: 0 }
+        samples:
+          type: array
+          maxItems: 4
+          items: { $ref: '#/components/schemas/GenerationObservation' }
+        resources: { $ref: '#/components/schemas/DeploymentResources' }
+    LogicalID:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[A-Za-z0-9_.-]+$'
+      description: Trusted logical model ID; configured model IDs cannot begin with a dot
+    Revision:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+    ControlPatch:
+      type: object
+      additionalProperties: false
+      description: >-
+        Missing preserves; nullable null clears the override (engine default).
+        Integer JSON spellings of equal exact value normalize identically.
+        ubatch <= batch including defaults 512/2048. Quantized V cache requires
+        explicit flash_attention=true in the resulting configuration. Per-model only.
+      properties:
+        context: { type: integer, minimum: 0, maximum: 1048576, nullable: true }
+        gpu_layers: { type: integer, minimum: 0, maximum: 999, nullable: true }
+        threads: { type: integer, minimum: 0, maximum: 1024, nullable: true }
+        batch: { type: integer, minimum: 1, maximum: 65536, nullable: true }
+        ubatch: { type: integer, minimum: 1, maximum: 65536, nullable: true }
+        cache_ram: { type: integer, minimum: 0, maximum: 1048576, nullable: true, description: MiB }
+        kv_type_k: { type: string, enum: [f16, q8_0, q4_0], nullable: true }
+        kv_type_v: { type: string, enum: [f16, q8_0, q4_0], nullable: true }
+        flash_attention: { type: boolean, nullable: false }
+    OperationRequest:
+      type: object
+      additionalProperties: false
+      required: [action, boot_id, expected_revision, idempotency_key]
+      properties:
+        action: { type: string, enum: [apply, start, stop, load, unload] }
+        boot_id: { type: string, minLength: 1 }
+        expected_revision: { $ref: '#/components/schemas/Revision' }
+        idempotency_key: { $ref: '#/components/schemas/LogicalID' }
+        model: { $ref: '#/components/schemas/LogicalID' }
+        patch: { $ref: '#/components/schemas/ControlPatch' }
+        timeout_seconds:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: Must also be <= operation_budget_seconds; missing uses server budget
+      oneOf:
+        - properties:
+            action: { enum: [apply] }
+          required: [model, patch]
+        - properties:
+            action: { enum: [load] }
+          required: [model]
+          not: { required: [patch] }
+        - properties:
+            action: { enum: [start, stop] }
+          not:
+            anyOf:
+              - required: [patch]
+              - required: [model]
+        - properties:
+            action: { enum: [unload] }
+          not: { required: [patch] }
+    RecoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [boot_id, expected_revision, verified_stopped]
+      properties:
+        boot_id: { type: string, minLength: 1 }
+        expected_revision: { $ref: '#/components/schemas/Revision' }
+        verified_stopped: { type: boolean, enum: [true] }
+    ParameterCapability:
+      type: object
+      additionalProperties: false
+      required: [type, nullable]
+      properties:
+        type: { type: string, enum: [integer, string, boolean] }
+        nullable: { type: boolean }
+        minimum: { type: integer }
+        maximum: { type: integer }
+        enum:
+          type: array
+          items: { type: string }
+    ControlSnapshot:
+      type: object
+      additionalProperties: false
+      required: [protocol_version, actions, operation_budget_seconds, operation_capacity, idempotency_retention_seconds, admission, boot_id, revision, state, running, process_generation, load_generation, models, parameters, configured_parameters, ready_probe, recovery_required]
+      properties:
+        protocol_version: { type: string, enum: ['p3a/1'] }
+        actions:
+          type: array
+          items: { type: string, enum: [apply, start, stop, load, unload] }
+        operation_budget_seconds: { type: integer, minimum: 1 }
+        operation_capacity: { type: integer, minimum: 1 }
+        idempotency_retention_seconds: { type: integer, enum: [86400] }
+        admission: { type: string, enum: [allowed, blocked] }
+        boot_id: { type: string, minLength: 1 }
+        revision: { $ref: '#/components/schemas/Revision' }
+        state: { type: string, enum: [unknown, stopped, running, ready, failed, interrupted] }
+        running: { type: boolean }
+        target_model:
+          type: string
+          description: Last apply's durable selected model; load does not mutate it
+        actual_model:
+          type: string
+          description: Current confirmed model/cleanup identity; not a live health probe
+        ready_token: { type: string, minLength: 1, description: Present only for current confirmed ready identity }
+        active_operation: { type: string }
+        process_generation: { type: integer, minimum: 0 }
+        load_generation: { type: integer, minimum: 0 }
+        models:
+          type: array
+          items: { type: string }
+        parameters:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/ParameterCapability' }
+        configured_parameters:
+          type: object
+          additionalProperties: { $ref: '#/components/schemas/ControlPatch' }
+        ready_probe: { type: string, enum: [router_health+loaded+target_props_no_autoload] }
+        recovery_required: { type: boolean }
+    ControlOperation:
+      type: object
+      additionalProperties: false
+      required: [id, boot_id, instance, action, state, stage, revision, started_at, deadline]
+      properties:
+        id: { type: string, minLength: 1 }
+        boot_id: { type: string, minLength: 1 }
+        instance: { type: string }
+        action: { type: string, enum: [apply, start, stop, load, unload] }
+        state: { type: string, enum: [running, succeeded, failed, deadline_exceeded, interrupted] }
+        stage: { type: string, enum: [accepted, prepare, stop, persist, start, router_health, load, ready_probe, unload] }
+        error_code: { type: string }
+        revision: { $ref: '#/components/schemas/Revision' }
+        started_at: { type: string, format: date-time }
+        deadline: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time }
+        ready_token: { type: string }
+        model: { type: string }
+    ControlError:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error: { type: string }
+        details: { type: string }
+        retryable: { type: boolean, enum: [false] }

@@ -84,8 +84,9 @@ func (i *Instance) ReserveProxyRequest(w http.ResponseWriter, r *http.Request) (
 		writeProxyError(w, r, err)
 		return nil, err
 	}
-	*r = *r.WithContext(context.WithValue(r.Context(), policyContextKey{}, permit))
-	return permit.Close, nil
+	ctx, cleanup := permit.BindContext(r.Context())
+	*r = *r.WithContext(context.WithValue(ctx, policyContextKey{}, permit))
+	return func() { cleanup(); permit.Close() }, nil
 }
 
 func (i *Instance) PrepareInferenceRequest(r *http.Request) (func(), error) {
@@ -113,10 +114,15 @@ func (i *Instance) PrepareInferenceRequest(r *http.Request) (func(), error) {
 			release()
 			return nil, err
 		}
+		if err := i.validateReadyRequest(r, true); err != nil {
+			release()
+			return nil, err
+		}
 	}
 	accepted = true
-	*r = *r.WithContext(context.WithValue(r.Context(), policyContextKey{}, permit))
-	return func() { release(); permit.Close() }, nil
+	ctx, cleanup := permit.BindContext(r.Context())
+	*r = *r.WithContext(context.WithValue(ctx, policyContextKey{}, permit))
+	return func() { cleanup(); release(); permit.Close() }, nil
 }
 
 // Validate the fixed native JSON protocol without rewriting it. Reject overrides
@@ -263,6 +269,9 @@ func (i *Instance) serveAdmitted(w http.ResponseWriter, r *http.Request) (err er
 			return err
 		}
 		defer permit.Close()
+		ctx, cleanup := permit.BindContext(r.Context())
+		defer cleanup()
+		r = r.WithContext(ctx)
 	}
 	// Acquire and inspect mode under the same lock. Controlled mode cannot change
 	// while running; a maintenance lease also excludes mode changes while stopped.
@@ -293,6 +302,11 @@ func (i *Instance) serveAdmitted(w http.ResponseWriter, r *http.Request) (err er
 	if controlled {
 		if err := validateControlledRequest(r, access); err != nil {
 			return err
+		}
+		if access == proxyUse {
+			if err := i.validateReadyRequest(r, false); err != nil {
+				return err
+			}
 		}
 	}
 	if i.proxy == nil {

@@ -1,0 +1,1 @@
+ALTER TABLE api_keys ADD COLUMN controller INTEGER NOT NULL DEFAULT 0 CHECK(controller IN (0, 1));

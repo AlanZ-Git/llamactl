@@ -8,9 +8,11 @@ import (
 	"llamactl/pkg/resourcepolicy"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func ownerPut(t *testing.T, router http.Handler, allow bool, s resourcepolicy.Snapshot, status int) resourcepolicy.Snapshot {
@@ -64,7 +66,7 @@ func TestOwnerPolicyHTTPDuringSSE(t *testing.T) {
 	}()
 	awaitAdmission(t, entered)
 	s = ownerPut(t, router, false, s, 200)
-	if s.AllowAI || s.Release != "unreleased_unknown" {
+	if s.AllowAI || s.Release != "draining" || s.ReleaseOperation == nil || s.ReleaseOperation.Mode != "graceful" {
 		t.Fatalf("pause %+v", s)
 	}
 	payload, _ := json.Marshal(inst.GetOptions())
@@ -98,8 +100,18 @@ func TestOwnerPolicyHTTPDuringSSE(t *testing.T) {
 	if _, err := im.StopInstance(inst.Name); err != nil {
 		t.Fatal(err)
 	}
-	if ownerGet(t, router).Release != "unreleased_unknown" {
-		t.Fatal("inflight zero falsely reports release")
+	// Windows may settle LISTEN observations until this operation's deadline.
+	// A persistent foreign listener must still never become released.
+	deadline := time.Now().Add(resourcepolicy.GracefulTimeout + time.Second)
+	for {
+		observed := ownerGet(t, router)
+		if observed.Release == "unreleased_unknown" {
+			break
+		}
+		if observed.Release == "released" || time.Now().After(deadline) {
+			t.Fatal("external backend listener must not be reported released", observed)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	s = ownerPut(t, router, true, s, 200)
 	if !s.AllowAI || inst.IsRunning() {
@@ -148,7 +160,7 @@ func TestOwnerPolicyHTTPAuthAndInput(t *testing.T) {
 		}
 		paused := ownerPut(t, router, false, initial, 200)
 		ownerPut(t, router, true, initial, 409)
-		if g.Snapshot() != paused {
+		if !reflect.DeepEqual(g.Snapshot(), paused) {
 			t.Fatal("stale resume changed policy")
 		}
 	}

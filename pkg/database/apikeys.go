@@ -10,6 +10,9 @@ import (
 
 // CreateKey inserts a new API key with permissions (transactional)
 func (db *sqliteDB) CreateKey(ctx context.Context, key *auth.APIKey, permissions []auth.KeyPermission) error {
+	if key.Controller && (key.PermissionMode != auth.PermissionModePerInstance || len(permissions) != 1 || permissions[0].CanStart || permissions[0].CanEvict) {
+		return fmt.Errorf("controller requires exactly one use-running-only instance permission")
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -18,8 +21,8 @@ func (db *sqliteDB) CreateKey(ctx context.Context, key *auth.APIKey, permissions
 
 	// Insert the API key
 	query := `
-		INSERT INTO api_keys (key_hash, name, user_id, permission_mode, expires_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO api_keys (key_hash, name, user_id, permission_mode, expires_at, created_at, updated_at, controller)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	var expiresAt sql.NullInt64
@@ -29,7 +32,7 @@ func (db *sqliteDB) CreateKey(ctx context.Context, key *auth.APIKey, permissions
 
 	result, err := tx.ExecContext(ctx, query,
 		key.KeyHash, key.Name, key.UserID, key.PermissionMode,
-		expiresAt, key.CreatedAt, key.UpdatedAt,
+		expiresAt, key.CreatedAt, key.UpdatedAt, key.Controller,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert API key: %w", err)
@@ -61,7 +64,7 @@ func (db *sqliteDB) CreateKey(ctx context.Context, key *auth.APIKey, permissions
 // GetKeyByID retrieves an API key by ID
 func (db *sqliteDB) GetKeyByID(ctx context.Context, id int) (*auth.APIKey, error) {
 	query := `
-		SELECT id, key_hash, name, user_id, permission_mode, expires_at, created_at, updated_at, last_used_at
+		SELECT id, key_hash, name, user_id, permission_mode, expires_at, created_at, updated_at, last_used_at, controller
 		FROM api_keys
 		WHERE id = ?
 	`
@@ -72,7 +75,7 @@ func (db *sqliteDB) GetKeyByID(ctx context.Context, id int) (*auth.APIKey, error
 
 	err := db.QueryRowContext(ctx, query, id).Scan(
 		&key.ID, &key.KeyHash, &key.Name, &key.UserID, &key.PermissionMode,
-		&expiresAt, &key.CreatedAt, &key.UpdatedAt, &lastUsedAt,
+		&expiresAt, &key.CreatedAt, &key.UpdatedAt, &lastUsedAt, &key.Controller,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -94,7 +97,7 @@ func (db *sqliteDB) GetKeyByID(ctx context.Context, id int) (*auth.APIKey, error
 // ListKeys retrieves all API keys, newest first
 func (db *sqliteDB) ListKeys(ctx context.Context) ([]*auth.APIKey, error) {
 	query := `
-		SELECT id, key_hash, name, user_id, permission_mode, expires_at, created_at, updated_at, last_used_at
+		SELECT id, key_hash, name, user_id, permission_mode, expires_at, created_at, updated_at, last_used_at, controller
 		FROM api_keys
 		ORDER BY created_at DESC
 	`
@@ -113,7 +116,7 @@ func (db *sqliteDB) ListKeys(ctx context.Context) ([]*auth.APIKey, error) {
 
 		err := rows.Scan(
 			&key.ID, &key.KeyHash, &key.Name, &key.UserID, &key.PermissionMode,
-			&expiresAt, &key.CreatedAt, &key.UpdatedAt, &lastUsedAt,
+			&expiresAt, &key.CreatedAt, &key.UpdatedAt, &lastUsedAt, &key.Controller,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan API key: %w", err)
@@ -138,7 +141,7 @@ func (db *sqliteDB) ListKeys(ctx context.Context) ([]*auth.APIKey, error) {
 // GetActiveKeys retrieves all non-expired API keys
 func (db *sqliteDB) GetActiveKeys(ctx context.Context) ([]*auth.APIKey, error) {
 	query := `
-		SELECT id, key_hash, name, user_id, permission_mode, expires_at, created_at, updated_at, last_used_at
+		SELECT id, key_hash, name, user_id, permission_mode, expires_at, created_at, updated_at, last_used_at, controller
 		FROM api_keys
 		WHERE expires_at IS NULL OR expires_at > ?
 		ORDER BY created_at DESC
@@ -159,7 +162,7 @@ func (db *sqliteDB) GetActiveKeys(ctx context.Context) ([]*auth.APIKey, error) {
 
 		err := rows.Scan(
 			&key.ID, &key.KeyHash, &key.Name, &key.UserID, &key.PermissionMode,
-			&expiresAt, &key.CreatedAt, &key.UpdatedAt, &lastUsedAt,
+			&expiresAt, &key.CreatedAt, &key.UpdatedAt, &lastUsedAt, &key.Controller,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan API key: %w", err)

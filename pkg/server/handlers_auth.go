@@ -13,6 +13,7 @@ import (
 
 // CreateKeyRequest represents the request body for creating a new API key.
 type CreateKeyRequest struct {
+	Controller     bool                     `json:"controller,omitempty"`
 	Name           string                   `json:"name"`
 	PermissionMode auth.PermissionMode      `json:"permission_mode"`
 	ExpiresAt      *int64                   `json:"expires_at,omitempty"`
@@ -29,6 +30,7 @@ type InstancePermissionSpec struct {
 
 // CreateKeyResponse represents the response returned when creating a new API key.
 type CreateKeyResponse struct {
+	Controller     bool                `json:"controller"`
 	ID             int                 `json:"id"`
 	Name           string              `json:"name"`
 	UserID         string              `json:"user_id"`
@@ -42,6 +44,7 @@ type CreateKeyResponse struct {
 
 // KeyResponse represents an API key in responses for list and get operations.
 type KeyResponse struct {
+	Controller     bool                `json:"controller"`
 	ID             int                 `json:"id"`
 	Name           string              `json:"name"`
 	UserID         string              `json:"user_id"`
@@ -96,6 +99,10 @@ func (h *Handler) CreateKey() http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "missing_permissions", "Permissions required when permission mode is 'per_instance'")
 			return
 		}
+		if req.Controller && (req.PermissionMode != auth.PermissionModePerInstance || len(req.Permissions) != 1 || (req.Permissions[0].CanStart != nil && *req.Permissions[0].CanStart) || (req.Permissions[0].CanEvict != nil && *req.Permissions[0].CanEvict)) {
+			writeError(w, http.StatusBadRequest, "invalid_controller_scope", "controller requires exactly one fixed instance; can_start/can_evict must be false or omitted")
+			return
+		}
 		if req.ExpiresAt != nil && *req.ExpiresAt <= time.Now().Unix() {
 			writeError(w, http.StatusBadRequest, "invalid_expires_at", "Expiration time must be in future")
 			return
@@ -110,7 +117,9 @@ func (h *Handler) CreateKey() http.HandlerFunc {
 			}
 			instanceIDMap := make(map[int]bool)
 			for _, inst := range instances {
-				instanceIDMap[inst.ID] = true
+				if !req.Controller || inst.ProtocolEnabled() {
+					instanceIDMap[inst.ID] = true
+				}
 			}
 
 			for _, p := range req.Permissions {
@@ -146,6 +155,7 @@ func (h *Handler) CreateKey() http.HandlerFunc {
 		}
 		now := time.Now().Unix()
 		apiKey := &auth.APIKey{
+			Controller:     req.Controller,
 			KeyHash:        keyHash,
 			Name:           req.Name,
 			UserID:         userID,
@@ -158,11 +168,11 @@ func (h *Handler) CreateKey() http.HandlerFunc {
 		// Convert Permissions to KeyPermissions, resolving nil flags to true
 		var keyPermissions []auth.KeyPermission
 		for _, p := range req.Permissions {
-			canStart := true
+			canStart := !req.Controller
 			if p.CanStart != nil {
 				canStart = *p.CanStart
 			}
-			canEvict := true
+			canEvict := !req.Controller
 			if p.CanEvict != nil {
 				canEvict = *p.CanEvict
 			}
@@ -183,6 +193,7 @@ func (h *Handler) CreateKey() http.HandlerFunc {
 
 		// Return response with plain-text key (only shown once)
 		response := CreateKeyResponse{
+			Controller:     apiKey.Controller,
 			ID:             apiKey.ID,
 			Name:           apiKey.Name,
 			UserID:         apiKey.UserID,
@@ -221,7 +232,7 @@ func (h *Handler) ListKeys() http.HandlerFunc {
 		response := make([]KeyResponse, 0, len(keys))
 		for _, key := range keys {
 			response = append(response, KeyResponse{
-				ID:             key.ID,
+				Controller: key.Controller, ID: key.ID,
 				Name:           key.Name,
 				UserID:         key.UserID,
 				PermissionMode: key.PermissionMode,
@@ -270,7 +281,7 @@ func (h *Handler) GetKey() http.HandlerFunc {
 
 		// Remove key_hash from response
 		response := KeyResponse{
-			ID:             key.ID,
+			Controller: key.Controller, ID: key.ID,
 			Name:           key.Name,
 			UserID:         key.UserID,
 			PermissionMode: key.PermissionMode,

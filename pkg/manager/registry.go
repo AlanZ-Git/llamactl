@@ -71,6 +71,13 @@ func (r *instanceRegistry) add(inst *instance.Instance) error {
 		return fmt.Errorf("instance %s already exists", inst.Name)
 	}
 
+	if inst.ProtocolEnabled() {
+		for _, existing := range r.instances {
+			if existing.ProtocolEnabled() {
+				return fmt.Errorf("only one protocol-enabled Router is supported")
+			}
+		}
+	}
 	r.instances[inst.Name] = inst
 
 	// Initialize running state if the instance is running

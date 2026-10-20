@@ -45,93 +45,102 @@ func SetupRouter(handler *Handler) *chi.Mux {
 
 	// Define routes
 	r.Route("/api/v1", func(r chi.Router) {
+		r.Get("/instances/{name}/control", handler.ControlHandler())
+		r.Put("/instances/{name}/control", httpreject.Handler(handler.ControlHandler()))
+		r.Post("/instances/{name}/operations", httpreject.Handler(handler.ControlHandler()))
+		r.Get("/instances/{name}/operations/{id}", handler.ControlHandler())
+		r.Post("/instances/{name}/tests", httpreject.Handler(handler.DeploymentTests()))
+		r.Get("/instances/{name}/tests/{id}", handler.DeploymentTests())
+		r.Post("/instances/{name}/tests/{id}/cancel", httpreject.Handler(handler.DeploymentTests()))
 
-		if handler.authMiddleware != nil && handler.cfg.Auth.RequireManagementAuth {
-			r.Use(handler.authMiddleware.ManagementAuthMiddleware())
-		}
+		r.Group(func(r chi.Router) {
+			r.Use(handler.groupAuth(false))
 
-		r.Get("/version", handler.VersionHandler())
-		r.Get("/resource-policy", handler.ResourcePolicy())
-		r.Put("/resource-policy", handler.ResourcePolicy())
+			r.Get("/version", handler.VersionHandler())
+			r.Get("/resources", handler.Resources())
+			r.Get("/resource-policy", handler.ResourcePolicy())
+			r.Put("/resource-policy", handler.ResourcePolicy())
+			r.Post("/resource-policy/release", handler.ResourcePolicy())
 
-		r.Get("/config", handler.ConfigHandler())
+			r.Get("/config", handler.ConfigHandler())
 
-		// API key management endpoints
-		r.Route("/auth", func(r chi.Router) {
-			r.Route("/keys", func(r chi.Router) {
-				r.Post("/", handler.CreateKey())                        // Create API key
-				r.Get("/", handler.ListKeys())                          // List API keys
-				r.Get("/{id}", handler.GetKey())                        // Get API key details
-				r.Delete("/{id}", handler.DeleteKey())                  // Delete API key
-				r.Get("/{id}/permissions", handler.GetKeyPermissions()) // Get key permissions
+			// API key management endpoints
+			r.Route("/auth", func(r chi.Router) {
+				r.Route("/keys", func(r chi.Router) {
+					r.Post("/", handler.CreateKey())                        // Create API key
+					r.Get("/", handler.ListKeys())                          // List API keys
+					r.Get("/{id}", handler.GetKey())                        // Get API key details
+					r.Delete("/{id}", handler.DeleteKey())                  // Delete API key
+					r.Get("/{id}/permissions", handler.GetKeyPermissions()) // Get key permissions
+				})
 			})
-		})
 
-		// Model download endpoints
-		r.Route("/models", func(r chi.Router) {
-			r.Post("/download", handler.DownloadModel())
-			r.Get("/", handler.ListModels())
-			r.Delete("/", handler.DeleteModel())
-			r.Route("/jobs", func(r chi.Router) {
-				r.Get("/", handler.ListJobs())
-				r.Get("/{id}", handler.GetJob())
-				r.Delete("/{id}", handler.DeleteJob())
+			// Model download endpoints
+			r.Route("/models", func(r chi.Router) {
+				r.Post("/download", handler.DownloadModel())
+				r.Get("/", handler.ListModels())
+				r.Delete("/", handler.DeleteModel())
+				r.Route("/jobs", func(r chi.Router) {
+					r.Get("/", handler.ListJobs())
+					r.Get("/{id}", handler.GetJob())
+					r.Delete("/{id}", handler.DeleteJob())
+				})
 			})
-		})
 
-		// Backend-specific endpoints
-		r.Route("/backends", func(r chi.Router) {
-			r.Route("/llama-cpp", func(r chi.Router) {
-				r.Get("/help", handler.LlamaServerHelpHandler())
-				r.Get("/version", handler.LlamaServerVersionHandler())
-				r.Get("/devices", handler.LlamaServerListDevicesHandler())
-				r.Post("/parse-command", handler.ParseLlamaCommand())
+			// Backend-specific endpoints
+			r.Route("/backends", func(r chi.Router) {
+				r.Route("/llama-cpp", func(r chi.Router) {
+					r.Get("/help", handler.LlamaServerHelpHandler())
+					r.Get("/version", handler.LlamaServerVersionHandler())
+					r.Get("/devices", handler.LlamaServerListDevicesHandler())
+					r.Post("/parse-command", handler.ParseLlamaCommand())
+				})
+				r.Route("/mlx", func(r chi.Router) {
+					r.Post("/parse-command", handler.ParseMlxCommand())
+				})
+				r.Route("/vllm", func(r chi.Router) {
+					r.Post("/parse-command", handler.ParseVllmCommand())
+				})
 			})
-			r.Route("/mlx", func(r chi.Router) {
-				r.Post("/parse-command", handler.ParseMlxCommand())
+
+			// Llama.cpp instance-specific endpoints
+			r.Route("/llama-cpp/{name}", func(r chi.Router) {
+				r.Get("/models", handler.LlamaCppListModels())
+				// Only local admission errors opt into settlement; backend responses
+				// and successful forwarding are untouched.
+				r.Post("/models/{model}/load", httpreject.Handler(handler.LlamaCppLoadModel()))
+				r.Post("/models/{model}/unload", httpreject.Handler(handler.LlamaCppUnloadModel()))
 			})
-			r.Route("/vllm", func(r chi.Router) {
-				r.Post("/parse-command", handler.ParseVllmCommand())
+
+			// Node management endpoints
+			r.Route("/nodes", func(r chi.Router) {
+				r.Get("/", handler.ListNodes()) // List all nodes
+
+				r.Route("/{name}", func(r chi.Router) {
+					r.Get("/", handler.GetNode())             // Get node details
+					r.Get("/health", handler.GetNodeHealth()) // Check node health
+				})
 			})
-		})
 
-		// Llama.cpp instance-specific endpoints
-		r.Route("/llama-cpp/{name}", func(r chi.Router) {
-			r.Get("/models", handler.LlamaCppListModels())
-			// Only local admission errors opt into settlement; backend responses
-			// and successful forwarding are untouched.
-			r.Post("/models/{model}/load", httpreject.Handler(handler.LlamaCppLoadModel()))
-			r.Post("/models/{model}/unload", httpreject.Handler(handler.LlamaCppUnloadModel()))
-		})
+			// Instance management endpoints
+			r.Route("/instances", func(r chi.Router) {
+				r.Get("/", handler.ListInstances()) // List all instances
 
-		// Node management endpoints
-		r.Route("/nodes", func(r chi.Router) {
-			r.Get("/", handler.ListNodes()) // List all nodes
+				r.Route("/{name}", func(r chi.Router) {
+					// Instance management
+					r.Get("/", handler.GetInstance())
+					r.Post("/", httpreject.Handler(handler.CreateInstance()))
+					r.Put("/", httpreject.Handler(handler.UpdateInstance()))
+					r.Delete("/", httpreject.Handler(handler.DeleteInstance()))
+					r.Post("/start", httpreject.Handler(handler.StartInstance()))
+					r.Post("/stop", httpreject.Handler(handler.StopInstance()))
+					r.Post("/restart", httpreject.Handler(handler.RestartInstance()))
+					r.Get("/logs", handler.GetInstanceLogs())
 
-			r.Route("/{name}", func(r chi.Router) {
-				r.Get("/", handler.GetNode())             // Get node details
-				r.Get("/health", handler.GetNodeHealth()) // Check node health
-			})
-		})
-
-		// Instance management endpoints
-		r.Route("/instances", func(r chi.Router) {
-			r.Get("/", handler.ListInstances()) // List all instances
-
-			r.Route("/{name}", func(r chi.Router) {
-				// Instance management
-				r.Get("/", handler.GetInstance())
-				r.Post("/", httpreject.Handler(handler.CreateInstance()))
-				r.Put("/", httpreject.Handler(handler.UpdateInstance()))
-				r.Delete("/", httpreject.Handler(handler.DeleteInstance()))
-				r.Post("/start", httpreject.Handler(handler.StartInstance()))
-				r.Post("/stop", httpreject.Handler(handler.StopInstance()))
-				r.Post("/restart", httpreject.Handler(handler.RestartInstance()))
-				r.Get("/logs", handler.GetInstanceLogs())
-
-				// Llama.cpp server proxy endpoints (proxied to the actual llama.cpp server)
-				r.Route("/proxy", func(r chi.Router) {
-					r.HandleFunc("/*", httpreject.Handler(handler.InstanceProxy())) // Only exact model maintenance can defer rejection.
+					// Llama.cpp server proxy endpoints (proxied to the actual llama.cpp server)
+					r.Route("/proxy", func(r chi.Router) {
+						r.HandleFunc("/*", httpreject.Handler(handler.InstanceProxy())) // Only exact model maintenance can defer rejection.
+					})
 				})
 			})
 		})
@@ -139,9 +148,7 @@ func SetupRouter(handler *Handler) *chi.Mux {
 
 	r.Route("/v1", func(r chi.Router) {
 
-		if handler.authMiddleware != nil && handler.cfg.Auth.RequireInferenceAuth {
-			r.Use(handler.authMiddleware.InferenceAuthMiddleware())
-		}
+		r.Use(handler.groupAuth(true))
 
 		r.Get("/models", handler.OpenAIListInstances()) // List instances in OpenAI-compatible format
 
@@ -167,9 +174,7 @@ func SetupRouter(handler *Handler) *chi.Mux {
 		// Private Routes
 		r.Group(func(r chi.Router) {
 
-			if handler.authMiddleware != nil && handler.cfg.Auth.RequireInferenceAuth {
-				r.Use(handler.authMiddleware.InferenceAuthMiddleware())
-			}
+			r.Use(handler.groupAuth(true))
 
 			// This handler auto starts the server if it's not running
 			llamaCppHandler := handler.LlamaCppProxy()

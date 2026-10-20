@@ -10,6 +10,9 @@ import (
 // ValidateControlled applies only candidate defaults; isolated alone stays legacy.
 func (o *Options) ValidateControlled(cfg *config.AppConfig) error {
 	if !o.Controlled {
+		if o.Control != nil {
+			return fmt.Errorf("control requires controlled=true")
+		}
 		return nil
 	}
 	if o.EnvironmentPolicy != "isolated" {
@@ -44,6 +47,9 @@ func (o *Options) ValidateControlled(cfg *config.AppConfig) error {
 				return fmt.Errorf("controlled requires typed backend parameters, not LLAMA_* environment overrides")
 			}
 		}
+	}
+	if err := o.validateControlConfig(cfg); err != nil {
+		return err
 	}
 	if o.PresetIni != nil {
 		for _, line := range strings.Split(*o.PresetIni, "\n") {

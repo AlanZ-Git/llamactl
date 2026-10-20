@@ -14,6 +14,8 @@ const (
 )
 
 type APIKey struct {
+	// Controller is restricted to one per-instance permission, use-running-only.
+	Controller     bool
 	ID             int
 	KeyHash        string
 	Name           string

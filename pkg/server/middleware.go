@@ -71,6 +71,35 @@ func NewAPIAuthMiddleware(authCfg config.AuthConfig, authStore database.AuthStor
 	}
 }
 
+// groupAuth preserves anonymous legacy groups only while no protocol instance
+// exists. Checking each request also covers a Router created after HTTP startup.
+func (h *Handler) groupAuth(inference bool) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			required := h.cfg.Auth.RequireManagementAuth
+			if inference {
+				required = h.cfg.Auth.RequireInferenceAuth
+			}
+			if cm, ok := h.InstanceManager.(interface{ ControlAuthRequired() bool }); ok {
+				required = required || cm.ControlAuthRequired()
+			}
+			if !required {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if h.authMiddleware == nil {
+				writeError(w, 401, "authentication_required", "authentication required")
+				return
+			}
+			middleware := h.authMiddleware.ManagementAuthMiddleware()
+			if inference {
+				middleware = h.authMiddleware.InferenceAuthMiddleware()
+			}
+			middleware(next).ServeHTTP(w, r)
+		})
+	}
+}
+
 // InferenceAuthMiddleware returns middleware for inference endpoints
 func (a *APIAuthMiddleware) InferenceAuthMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -89,7 +118,7 @@ func (a *APIAuthMiddleware) InferenceAuthMiddleware() func(http.Handler) http.Ha
 
 			// Try database authentication first
 			var foundKey *auth.APIKey
-			if a.requireInferenceAuth && a.authStore != nil {
+			if a.authStore != nil {
 				activeKeys, err := a.authStore.GetActiveKeys(r.Context())
 				if err != nil {
 					log.Printf("Failed to get active inference keys: %v", err)
@@ -177,6 +206,9 @@ func (a *APIAuthMiddleware) ResolveInstancePermission(ctx context.Context, insta
 		return &auth.KeyPermission{InstanceID: instanceID, CanStart: true, CanEvict: true}, nil
 	}
 
+	if apiKey.Controller && apiKey.PermissionMode != auth.PermissionModePerInstance {
+		return nil, fmt.Errorf("invalid controller permission mode")
+	}
 	// If permission_mode == "allow_all", allow all
 	if apiKey.PermissionMode == auth.PermissionModeAllowAll {
 		return &auth.KeyPermission{KeyID: apiKey.ID, InstanceID: instanceID, CanStart: true, CanEvict: true}, nil
@@ -192,6 +224,13 @@ func (a *APIAuthMiddleware) ResolveInstancePermission(ctx context.Context, insta
 		return nil, fmt.Errorf("permission denied: key does not have access to this instance")
 	}
 
+	if apiKey.Controller {
+		permissions, err := a.authStore.GetPermissions(ctx, apiKey.ID)
+		if err != nil || len(permissions) != 1 || permissions[0].InstanceID != instanceID || perm.CanStart || perm.CanEvict {
+			return nil, fmt.Errorf("invalid controller instance scope")
+		}
+		return &auth.KeyPermission{KeyID: apiKey.ID, InstanceID: instanceID}, nil
+	}
 	return perm, nil
 }
 

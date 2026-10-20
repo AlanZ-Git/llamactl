@@ -19,22 +19,33 @@ import (
 type process struct {
 	instance *Instance // Back-reference for SetStatus, GetOptions
 
-	mu            sync.RWMutex
-	cmd           *exec.Cmd
-	ctx           context.Context
-	cancel        context.CancelFunc
-	stdin         io.Closer
-	stdout        io.ReadCloser
-	stderr        io.ReadCloser
-	restarts      int
-	restartCancel context.CancelFunc
-	monitorDone   chan struct{}
+	mu                 sync.RWMutex
+	cmd                *exec.Cmd
+	ctx                context.Context
+	cancel             context.CancelFunc
+	stdin              io.Closer
+	stdout             io.ReadCloser
+	stderr             io.ReadCloser
+	restarts           int
+	restartCancel      context.CancelFunc
+	monitorDone        chan struct{}
+	finishIO           func()
+	tree               *ownedTree
+	treeHost           string
+	treePort           int
+	treeDocker         bool
+	resourceGeneration uint64 // incremented only when an owned tree is published
+	// Immutable after construction; per-process seams for OS failure regressions.
+	launchTree func(*exec.Cmd) (*ownedTree, error)
+	signalTree func(*ownedTree, bool) error
 }
 
 // newProcess creates a new process component for the given instance
 func newProcess(instance *Instance) *process {
 	return &process{
-		instance: instance,
+		instance:   instance,
+		launchTree: startOwnedTree,
+		signalTree: func(tree *ownedTree, force bool) error { return tree.signal(force) },
 	}
 }
 
@@ -49,12 +60,26 @@ func (p *process) start() error {
 }
 
 func (p *process) startPermit(permit *resourcepolicy.Permit) error {
+	return p.startPermitContext(context.Background(), permit)
+}
+
+func (p *process) startPermitContext(operationContext context.Context, permit *resourcepolicy.Permit) error {
+	if err := operationContext.Err(); err != nil {
+		return err
+	}
 	if err := permit.Check(); err != nil {
 		return err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.tree != nil {
+		select {
+		case <-p.tree.done:
+		default:
+			return fmt.Errorf("previous owned process tree has not exited")
+		}
+	}
 	if p.instance.IsRunning() {
 		return fmt.Errorf("instance %s is already running", p.instance.Name)
 	}
@@ -94,7 +119,7 @@ func (p *process) startPermit(permit *resourcepolicy.Permit) error {
 		p.instance.proxy.updateLastRequestTime()
 	}
 
-	// Create context before building command (needed for CommandContext)
+	// Generation-scoped health/loading cancellation; OS termination is tree-owned.
 	ctx, cancel := context.WithCancel(context.Background())
 	p.ctx, p.cancel = ctx, cancel
 
@@ -143,11 +168,18 @@ func (p *process) startPermit(permit *resourcepolicy.Permit) error {
 	if port > 0 {
 		deadline := time.Now().Add(15 * time.Second)
 		for portInUse(host, port) {
+			if err := permit.Check(); err != nil {
+				return err
+			}
 			if time.Now().After(deadline) {
 				return fmt.Errorf("port %d is still occupied by a surviving process; refusing to start a second server on it", port)
 			}
 			log.Printf("Instance %s: port %d still in use, waiting for it to be released...", p.instance.Name, port)
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-operationContext.Done():
+				return operationContext.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 	}
 
@@ -174,7 +206,28 @@ func (p *process) startPermit(permit *resourcepolicy.Permit) error {
 	if err := permit.Check(); err != nil {
 		return err
 	}
-	if err := p.cmd.Start(); err != nil {
+	if err := permit.Spawn(func() error {
+		if err := operationContext.Err(); err != nil {
+			return err
+		}
+		p.instance.admission.mu.Lock()
+		retired := p.instance.admission.retired
+		p.instance.admission.mu.Unlock()
+		if retired {
+			return fmt.Errorf("instance is retired")
+		}
+		tree, err := p.launchTree(p.cmd)
+		if tree != nil {
+			// A failed Windows startup may retain a quarantined owned tree until
+			// kernel exit evidence arrives. Never start over that live generation.
+			tree.bindReleasePolicy(p.instance.policy)
+			p.tree = tree
+			p.resourceGeneration++
+			p.treeHost, p.treePort = host, port
+			p.treeDocker = candidate.DockerEnabled != nil && *candidate.DockerEnabled
+		}
+		return err
+	}); err != nil {
 		return fmt.Errorf("failed to start instance %s: %w", p.instance.Name, err)
 	}
 	started = true
@@ -184,10 +237,15 @@ func (p *process) startPermit(permit *resourcepolicy.Permit) error {
 	// Create channel for monitor completion signaling
 	p.monitorDone = make(chan struct{})
 
-	go p.instance.logger.readOutput(p.stdout)
-	go p.instance.logger.readOutput(p.stderr)
+	finishOutput := p.instance.logger.startOutput(p.stdout, p.stderr)
+	stdin := p.stdin
+	p.finishIO = func() {
+		cancel()
+		_ = stdin.Close()
+		finishOutput()
+	}
 
-	go p.monitorProcess()
+	go p.monitorGeneration(p.cmd, p.monitorDone, p.tree, p.finishIO)
 
 	return nil
 }
@@ -221,6 +279,7 @@ func (p *process) stop() error {
 	// inflight drain below runs; stop() must signal only the process it saw
 	// when it locked, never a newer generation.
 	cmd := p.cmd
+	tree := p.tree
 	stdin := p.stdin
 	monitorDone := p.monitorDone
 
@@ -238,29 +297,37 @@ func (p *process) stop() error {
 	}
 
 	// Now set status to stopped to signal intentional stop
+	p.mu.Lock()
+	if p.cmd != cmd {
+		p.mu.Unlock()
+		return fmt.Errorf("process generation changed during stop")
+	}
 	p.instance.SetStatus(Stopped)
+	p.mu.Unlock()
 
-	// Graceful stop: close stdin (EOF is a shutdown request where the
-	// backend honors it), then the platform interrupt (SIGINT on Unix).
-	// On Windows SIGINT/Ctrl-C do not reach the child, so the force-kill
-	// below is the reliable stop; the shorter grace there trims the wait.
+	// EOF remains useful for backends that implement it; the owned platform
+	// interrupt also reaches Windows backends in their isolated console.
 	if stdin != nil {
 		if cerr := stdin.Close(); cerr != nil {
 			log.Printf("Failed to close stdin for instance %s: %v", p.instance.Name, cerr)
 		}
 	}
-	signalStop(cmd)
+	if tree != nil {
+		if err := tree.stopSignal(); err != nil {
+			return err
+		}
+	} else {
+		signalStop(cmd)
+	}
 
 	// If no process exists, we can return immediately
 	if cmd == nil || monitorDone == nil {
-		p.instance.logger.close()
+		p.closeLoggerGeneration(cmd)
 		return nil
 	}
 
-	// Wait for the process to exit after the shutdown signal. On Unix a
-	// SIGINT graceful stop usually finishes in a second or two and the long
-	// grace is the safety net. On Windows the stop is the force-kill, so use
-	// a shorter grace there to avoid a slow shutdown.
+	// Ordinary Stop retains its existing platform grace and explicit fallback.
+	// Owner graceful release uses ReleaseOwned and never takes this force path.
 	killGrace := 30 * time.Second
 	if runtime.GOOS == "windows" {
 		killGrace = 5 * time.Second
@@ -272,26 +339,39 @@ func (p *process) stop() error {
 		log.Printf("Instance %s shut down gracefully", p.instance.Name)
 	case <-time.After(killGrace):
 		// Force kill if it doesn't exit within 30 seconds
-		if cmd.Process != nil {
-			killErr := cmd.Process.Kill()
-			if killErr != nil {
-				log.Printf("Failed to force kill instance %s: %v", p.instance.Name, killErr)
+		if tree != nil || cmd.Process != nil {
+			var killErr error
+			if tree != nil {
+				killErr = tree.signal(true)
+			} else {
+				killErr = cmd.Process.Kill()
 			}
-			log.Printf("Instance %s did not stop in time, force killed", p.instance.Name)
+			if killErr != nil {
+				return fmt.Errorf("terminate owned instance %s: %w", p.instance.Name, killErr)
+			}
+			log.Printf("Instance %s did not stop in time, termination requested", p.instance.Name)
 
 			// Wait a bit more for the monitor to finish after force kill
 			select {
 			case <-monitorDone:
 				// Monitor completed after force kill
 			case <-time.After(10 * time.Second):
-				log.Printf("Warning: Monitor goroutine did not complete after force kill for instance %s", p.instance.Name)
+				return fmt.Errorf("owned instance %s exit was not confirmed", p.instance.Name)
 			}
 		}
 	}
 
-	p.instance.logger.close()
+	p.closeLoggerGeneration(cmd)
 
 	return nil
+}
+
+func (p *process) closeLoggerGeneration(cmd *exec.Cmd) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cmd == cmd {
+		p.instance.logger.close()
+	}
 }
 
 // restart manually restarts the process (resets restart counter)
@@ -331,7 +411,13 @@ func (p *process) waitForHealthy(timeout int) error {
 		timeout = 30 // Default to 30 seconds if no timeout is specified
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	p.mu.RLock()
+	parent := p.ctx
+	p.mu.RUnlock()
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeout)*time.Second)
 	defer cancel()
 
 	// Keep target and credential from the same options generation throughout
@@ -398,8 +484,13 @@ func (p *process) monitorProcess() {
 	p.mu.Lock()
 	myCmd := p.cmd
 	myDone := p.monitorDone
+	myTree := p.tree
+	finishIO := p.finishIO
 	p.mu.Unlock()
+	p.monitorGeneration(myCmd, myDone, myTree, finishIO)
+}
 
+func (p *process) monitorGeneration(myCmd *exec.Cmd, myDone chan struct{}, myTree *ownedTree, finishIO func()) {
 	defer func() {
 		p.mu.Lock()
 		if myDone != nil {
@@ -414,8 +505,20 @@ func (p *process) monitorProcess() {
 		p.mu.Unlock()
 	}()
 
-	err := myCmd.Wait()
+	var err error
+	if myTree != nil {
+		<-myTree.done
+		err = myTree.result()
+	} else {
+		err = myCmd.Wait() // Compatibility for embedded/manual process fixtures.
+	}
 
+	// Exit owns cleanup regardless of externally changed status. Capture-bound
+	// cleanup also runs for stale monitors, but cannot close a new generation.
+	// Join output readers outside the process/admission mutexes.
+	if finishIO != nil {
+		finishIO()
+	}
 	p.mu.Lock()
 
 	// Stale monitor: a newer start replaced p.cmd while we were waiting.
@@ -426,6 +529,9 @@ func (p *process) monitorProcess() {
 		return
 	}
 
+	if finishIO == nil {
+		p.instance.logger.close()
+	} // Manual-command fixtures.
 	// Check if the instance was intentionally stopped
 	if !p.instance.IsRunning() {
 		p.mu.Unlock()
@@ -433,7 +539,6 @@ func (p *process) monitorProcess() {
 	}
 
 	p.instance.SetStatus(Stopped)
-	p.instance.logger.close()
 
 	// Cancel any existing restart context since we're handling a new exit
 	if p.restartCancel != nil {
@@ -565,7 +670,7 @@ func (p *process) buildCommand() (*exec.Cmd, error) {
 	args := p.instance.buildCommandArgs()
 
 	// Create the exec.Cmd
-	cmd := exec.CommandContext(p.ctx, command, args...)
+	cmd := exec.Command(command, args...)
 
 	// Environment policy applies only to this child, never to the parent.
 	cmd.Env = p.instance.childEnvironment()

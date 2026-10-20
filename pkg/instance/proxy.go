@@ -137,6 +137,8 @@ func (p *proxy) build() (*httputil.ReverseProxy, error) {
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		originalDirector(req)
+		// Manager readiness capabilities never belong to an engine or remote node.
+		req.Header.Del("X-Ready-Token")
 
 		// Add API key header for remote instances
 		if key != "" {

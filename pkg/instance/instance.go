@@ -26,6 +26,7 @@ type Instance struct {
 	localNodeName          string `json:"-"` // Name of the local node for remote detection
 
 	admission admissionGate
+	control   controlRuntime // protected by admission.mu, not a second admission gate
 	policy    *resourcepolicy.Gate
 
 	status  *status  `json:"-"`
@@ -230,6 +231,20 @@ func (i *Instance) SetStatus(s Status) {
 	i.admission.mu.Lock()
 	defer i.admission.mu.Unlock()
 	if i.status != nil {
+		if s != i.status.get() {
+			i.control.token = ""
+			if s == Running {
+				i.control.processGeneration++
+			}
+			if i.ProtocolEnabled() && i.control.active == "" && i.control.boot != "" && i.control.state != "unknown" && !i.control.interrupted {
+				if s == Stopped {
+					i.control.state, i.control.model = "stopped", ""
+				}
+				if s == Failed {
+					i.control.state, i.control.model = "failed", ""
+				}
+			}
+		}
 		i.status.set(s)
 	}
 }

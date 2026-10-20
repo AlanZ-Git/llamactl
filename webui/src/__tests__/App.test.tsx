@@ -7,8 +7,18 @@ import { instancesApi } from '@/lib/api'
 import {BackendType, type Instance } from '@/types/instance'
 import { AuthProvider } from '@/contexts/AuthContext'
 
+// The deployment panel has its own API/lifecycle tests. Keep these native
+// instance-management tests isolated while checking the panel is reachable.
+vi.mock('@/components/DeploymentTests', () => ({ default: () => <section data-testid="deployment-test-panel">Deployment test panel</section> }))
+
 // Mock the API
 vi.mock('@/lib/api', () => ({
+  resourcePolicyApi: {
+    get: vi.fn(() => Promise.resolve({ allow_ai: true, admission: 'allowed', durable: false, release: 'not_requested', boot_id: 'synthetic', revision: 0 })),
+    update: vi.fn(),
+    release: vi.fn(),
+  },
+  resourcesApi: { get: vi.fn(() => Promise.reject(new Error('Synthetic metrics unavailable'))) },
   instancesApi: {
     list: vi.fn(),
     get: vi.fn(),
@@ -109,6 +119,12 @@ describe('App Component - Critical Business Logic Only', () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
+  })
+
+  it('keeps deployment tests on the existing instance management route', async () => {
+    renderApp()
+    expect(await screen.findByTestId('deployment-test-panel')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Instances' })).toBeInTheDocument()
   })
 
   describe('End-to-End Instance Management', () => {

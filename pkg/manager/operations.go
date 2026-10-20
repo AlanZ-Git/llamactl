@@ -199,6 +199,13 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 		return nil, fmt.Errorf("maximum number of instances (%d) reached", im.globalConfig.Instances.MaxInstances)
 	}
 
+	if options.Control != nil {
+		for _, existing := range im.registry.list() {
+			if existing.ProtocolEnabled() {
+				return nil, instance.ProtocolRequired()
+			}
+		}
+	}
 	// Assign and validate port for backend-specific options
 	currentPort := im.getPortFromOptions(options)
 	var allocatedPort int
@@ -227,7 +234,13 @@ func (im *instanceManager) CreateInstance(name string, options *instance.Options
 		return nil, fmt.Errorf("prepare instance: %w", err)
 	}
 
-	lease, err := inst.BeginMaintenance()
+	var lease *instance.Maintenance
+	if inst.ProtocolEnabled() {
+		inst.InitializeControl(im.initControl().boot)
+		lease, err = inst.BeginControl(im.initControl().boot, inst.GetOptions().ConfigRevision, true, true)
+	} else {
+		lease, err = inst.BeginMaintenance()
+	}
 	if err != nil {
 		im.ports.release(allocatedPort)
 		return nil, err

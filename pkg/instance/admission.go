@@ -54,6 +54,7 @@ type Maintenance struct {
 	instance *Instance
 	closed   bool
 	permit   *resourcepolicy.Permit
+	protocol bool
 }
 
 // BeginWorkMaintenance checks the owner latch before ordinary instance contention.
@@ -77,6 +78,13 @@ func (i *Instance) IsControlled() bool {
 func (i *Instance) BeginMaintenance() (*Maintenance, error) { return i.beginMaintenance(false) }
 
 func (i *Instance) beginMaintenance(work bool) (*Maintenance, error) {
+	if i.ProtocolEnabled() {
+		return nil, ProtocolRequired()
+	}
+	return i.beginMaintenanceInternal(work)
+}
+
+func (i *Instance) beginMaintenanceInternal(work bool) (*Maintenance, error) {
 	permit, err := i.policy.Acquire()
 	if err != nil && work {
 		return nil, err
@@ -155,6 +163,9 @@ func (m *Maintenance) checkModeChange(opts *Options) error {
 	if opts == nil {
 		return fmt.Errorf("instance options cannot be nil")
 	}
+	if opts.Control != nil && !m.protocol {
+		return ProtocolRequired()
+	}
 	i := m.instance
 	i.admission.mu.Lock()
 	defer i.admission.mu.Unlock()
@@ -217,6 +228,17 @@ func (m *Maintenance) Retire() error {
 		return err
 	}
 	i := m.instance
+	if i.process != nil {
+		i.process.mu.Lock()
+		defer i.process.mu.Unlock()
+		if tree := i.process.tree; tree != nil {
+			select {
+			case <-tree.done:
+			default:
+				return fmt.Errorf("owned process tree has not exited")
+			}
+		}
+	}
 	i.admission.mu.Lock()
 	defer i.admission.mu.Unlock()
 	if i.GetStatus() != Stopped && i.GetStatus() != Failed {

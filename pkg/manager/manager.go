@@ -8,6 +8,7 @@ import (
 	"llamactl/pkg/database"
 	"llamactl/pkg/instance"
 	"llamactl/pkg/resourcepolicy"
+	"llamactl/pkg/resources"
 	"log"
 	"sort"
 	"sync"
@@ -46,6 +47,9 @@ type instanceManager struct {
 	// Synchronization
 	instanceLocks sync.Map // map[string]*sync.Mutex - per-instance locks for concurrent operations
 	shutdownOnce  sync.Once
+	controlOnce   sync.Once
+	control       *controlLedger
+	resources     *resources.Sampler
 }
 
 // New creates a new instance of InstanceManager with dependency injection.
@@ -83,6 +87,8 @@ func New(globalConfig *config.AppConfig, db database.InstanceStore) InstanceMana
 		startupBlocked: !policy.Snapshot().AllowAI,
 	}
 
+	policy.SetReleaseRunner(im.releaseOwned)
+
 	// Initialize lifecycle manager (needs reference to manager for Stop/Evict operations)
 	checkInterval := time.Duration(globalConfig.Instances.TimeoutCheckInterval) * time.Minute
 	im.lifecycle = newLifecycleManager(registry, im, checkInterval, true)
@@ -95,6 +101,10 @@ func New(globalConfig *config.AppConfig, db database.InstanceStore) InstanceMana
 	// Start the lifecycle manager
 	im.lifecycle.start()
 
+	collector := resources.NewCollector(im.collectOwnedResources)
+	im.resources = resources.NewSampler(collector.Collect, im.resourcesIdle)
+	im.resources.Start()
+
 	return im
 }
 
@@ -105,15 +115,23 @@ func (im *instanceManager) persistInstance(inst *instance.Instance) error {
 
 func (im *instanceManager) Shutdown() {
 	im.shutdownOnce.Do(func() {
+		if im.resources != nil {
+			im.resources.Stop()
+		}
+		im.shutdownControl()
 		// 1. Stop lifecycle manager (stops timeout checker)
 		im.lifecycle.stop()
 
-		// 2. Get running instances (no lock needed - registry handles it)
-		running := im.registry.listRunning()
+		// Include protocol generations interrupted while shutting down: registry
+		// Running alone is not proof that an owned tree has exited.
+		running := im.registry.list()
 
 		// 3. Stop local instances concurrently
 		var wg sync.WaitGroup
 		for _, inst := range running {
+			if !inst.ProtocolEnabled() && !inst.IsRunning() {
+				continue
+			}
 			if inst.IsRemote() {
 				continue // Skip remote instances
 			}
@@ -121,6 +139,20 @@ func (im *instanceManager) Shutdown() {
 			go func(inst *instance.Instance) {
 				defer wg.Done()
 				log.Printf("Stopping instance %s...\n", inst.Name)
+				if inst.ProtocolEnabled() {
+					s := inst.ControlSnapshot()
+					lease, err := inst.BeginControl(s.BootID, s.Revision, false, true)
+					if err == nil {
+						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						err = lease.StopControl(ctx)
+						cancel()
+						lease.Close()
+					}
+					if err != nil {
+						log.Printf("Control shutdown failed for %s: %v", inst.Name, err)
+					}
+					return
+				}
 				if err := inst.Stop(); err != nil {
 					log.Printf("Error stopping instance %s: %v\n", inst.Name, err)
 				}
@@ -199,7 +231,7 @@ func (im *instanceManager) loadInstance(persistedInst *instance.Instance) error 
 
 	// Create new inst using NewInstance (handles validation, defaults, setup)
 	constructor := instance.NewChecked
-	if im.startupBlocked && !isRemote {
+	if (im.startupBlocked || (options != nil && options.Control != nil)) && !isRemote {
 		constructor = instance.NewDescriptor
 	}
 	inst, err := constructor(name, im.globalConfig, options, statusCallback)
@@ -208,6 +240,9 @@ func (im *instanceManager) loadInstance(persistedInst *instance.Instance) error 
 	}
 
 	// Restore persisted fields that NewInstance doesn't set
+	if inst.ProtocolEnabled() {
+		inst.InitializeControl(im.initControl().boot)
+	}
 	inst.ID = persistedInst.ID
 	inst.Created = persistedInst.Created
 	if inst.IsControlled() || (im.startupBlocked && !isRemote) {

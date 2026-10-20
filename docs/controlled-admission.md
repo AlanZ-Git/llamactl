@@ -1,10 +1,11 @@
 # Controlled-instance admission foundation (P2a)
 
 This is an opt-in **admission foundation**, not the final controlled protocol.
-Owner new-admission pause is documented separately in [resource-policy.md](resource-policy.md);
-it does not drain work or terminate processes. There are no ready tokens,
-instance-configuration revisions, controller scopes, operation queues,
-asynchronous operation resources or new UI.
+Owner pause and asynchronous graceful/immediate release are documented separately
+in [resource-policy.md](resource-policy.md). Owner immediate is a privileged,
+revocable process-tree operation, not an ordinary maintenance admission bypass
+available to inference clients. There are no ready tokens, instance-configuration
+revisions, controller scopes, general operation queues or new UI.
 Running does not mean model-ready, and stopped does not prove VRAM release.
 
 ## Configuration
@@ -71,7 +72,10 @@ serialization (not a new busy policy); its leases are tracked so a controlled
 transition cannot overlap it. Inference obtains a shared use permit before request validation
 and backend forwarding. The permit remains held until forwarding returns,
 including SSE EOF, cancellation, validation errors, backend errors and panic
-unwinding. Two inference requests may overlap.
+unwinding. Two inference requests may overlap. Graceful owner pause leaves existing
+streams intact; immediate owner release cancels outbound contexts (including native
+loading). An interrupted stream is aborted, not completed with synthetic `[DONE]`;
+normal backend SSE bytes and natural completion remain unchanged.
 
 Maintenance is exclusive: Update/Delete/Start/Stop/Restart, direct lifecycle and
 options APIs, prepared-option commits, and native Router load/unload all enter
@@ -87,8 +91,9 @@ The checked maintenance capability has private instance identity and active
 lifetime validation; internal operations reuse it rather than reacquiring the
 gate. A separately scoped operation mutex protects misuse of the capability,
 not admission or status queries. File/process/network/DB work never holds the
-gate mutex. This leaves room for a later priority-block latch, but does **not**
-provide owner pause today. `PrepareOptions` callers must always `Close`; direct
+gate mutex. The separate owner policy closes new admission before this ordinary
+gate and does not wait for an SSE-held maintenance/use lease. `PrepareOptions`
+callers must always `Close`; direct
 successful `Commit` releases its owned lease. Manager-owned candidates retain
 the surrounding maintenance lease through restart and persistence.
 
@@ -96,10 +101,13 @@ P1 candidate validation and preset preparation still precede stopping the old
 process. Files, SQLite and processes are **not** one transaction. A later commit,
 start or persistence failure can leave changed/stopped state and is returned as
 an error, not rolled back or reported as successful. This foundation does not
-add crash recovery or guaranteed engine cancellation. Manager shutdown also uses
-the ordinary Stop gate: active controlled work yields a logged busy error, not
-forced termination or a promise that every child exited. Drain work before
-shutdown; force/owner-stop semantics are deferred.
+add crash recovery. Ordinary manager shutdown still uses the Stop gate: active
+controlled work yields a logged busy error, not an implicit owner-immediate
+request. Deliberate owner release is separate: pause starts graceful drain with
+no deadline escalation; authenticated immediate cancels inference/loading and
+terminates owned local trees without waiting for ordinary maintenance. Release
+requires OS/tree and port evidence, not this gate's use count or instance status.
+See the owner contract for deadlines, persistence failures and resume linearization.
 
 ## Proxy policy
 

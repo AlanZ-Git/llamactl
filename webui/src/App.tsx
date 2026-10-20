@@ -1,5 +1,7 @@
 import { useState } from "react";
 import Header from "@/components/Header";
+import OwnerResources from "@/components/OwnerResources";
+import DeploymentTests from "@/components/DeploymentTests";
 import InstanceList from "@/components/InstanceList";
 import ModelsList from "@/components/ModelsList";
 import NodesList from "@/components/nodes/NodesList";
@@ -87,6 +89,7 @@ function App() {
           onShowSettings={handleShowSettings}
         />
         <main className="container mx-auto max-w-4xl px-4 py-8">
+          <OwnerResources />
           {/* Tab Navigation */}
           <div className="border-b border-border mb-6">
             <div className="flex gap-4">
@@ -130,7 +133,7 @@ function App() {
           </div>
 
           {/* Tab Content */}
-          {activeTab === 'instances' && <InstanceList editInstance={handleEditInstance} />}
+          {activeTab === 'instances' && <><DeploymentTests /><InstanceList editInstance={handleEditInstance} /></>}
           {activeTab === 'models' && (
             <ModelsProvider>
               <ModelsList />

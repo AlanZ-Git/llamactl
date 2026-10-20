@@ -294,7 +294,12 @@ func (db *sqliteDB) rowToInstance(row *instanceRow) (*instance.Instance, error) 
 
 // Save saves an instance to the database (insert or update)
 func (db *sqliteDB) Save(inst *instance.Instance) error {
-	ctx := context.Background()
+	return db.SaveContext(context.Background(), inst)
+}
+
+// SaveContext lets bounded control operations cancel database waits. Legacy
+// callers retain Save's background-context behavior.
+func (db *sqliteDB) SaveContext(ctx context.Context, inst *instance.Instance) error {
 
 	// Try to get existing instance
 	existing, err := db.GetByName(ctx, inst.Name)

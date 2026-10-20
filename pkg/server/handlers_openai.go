@@ -95,6 +95,17 @@ func (h *Handler) OpenAIListInstances() http.HandlerFunc {
 
 		// For each llama.cpp instance, try to fetch models and add them as separate entries
 		for _, inst := range instances {
+			if h.authMiddleware != nil {
+				if err := h.authMiddleware.CheckInstancePermission(r.Context(), inst.ID); err != nil {
+					continue
+				}
+			}
+			if inst.ProtocolEnabled() {
+				for _, model := range inst.ControlSnapshot().Models {
+					openaiInstances = append(openaiInstances, OpenAIInstance{ID: inst.Name + "/" + model, Object: "model", Created: inst.Created, OwnedBy: inst.Name})
+				}
+				continue
+			}
 
 			if inst.GetBackendType() == backends.BackendTypeLlamaCpp && inst.IsRunning() {
 				// Try to fetch models from the instance

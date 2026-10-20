@@ -1,8 +1,10 @@
+import type { ControlSnapshot, DeploymentTest, DeploymentTestRequest, TestEnvelope } from '@/types/deploymentTest';
 import type { CreateInstanceOptions, Instance } from "@/types/instance";
 import type { AppConfig } from "@/types/config";
 import type { ApiKey, CreateKeyRequest, CreateKeyResponse, KeyPermissionResponse } from "@/types/apiKey";
 import type { DownloadJob, CachedModel, ModelFormat } from "@/types/model";
 import { handleApiError } from "./errorUtils";
+import { validateResourcePolicy, type ResourceSnapshot } from '@/types/resources';
 
 // Adding baseURI as a prefix to support being served behind a subpath
 // e.g. when llmamctl's `/` is served behind a reverse proxy at `/proxy/...`
@@ -13,7 +15,8 @@ export const API_BASE = `${document.baseURI}api/v1`;
 async function apiCall<T>(
   endpoint: string,
   options: RequestInit = {},
-  responseType: "json" | "text" = "json"
+  responseType: "json" | "text" = "json",
+  notifyUnauthorized = true
 ): Promise<T> {
   const url = `${API_BASE}${endpoint}`;
 
@@ -39,7 +42,7 @@ async function apiCall<T>(
 
     // Signal auth loss so the app falls back to the login dialog instead of
     // stranding contexts with error banners
-    if (response.status === 401) {
+    if (response.status === 401 && notifyUnauthorized) {
       window.dispatchEvent(new CustomEvent('llamactl:unauthorized'))
     }
 
@@ -71,6 +74,36 @@ async function apiCall<T>(
     throw new Error("Network error occurred");
   }
 }
+
+// Owner-only 401 is a capability denial, not proof that the legacy management
+// session died. In auth-disabled compatibility mode, logging out here loops.
+export const resourcePolicyApi = {
+  get: async (signal?: AbortSignal) => validateResourcePolicy(await apiCall<unknown>(
+    '/resource-policy', { signal, cache: 'no-store' }, 'json', false)),
+  update: async (allow: boolean, boot: string, revision: number, signal?: AbortSignal) =>
+    validateResourcePolicy(await apiCall<unknown>('/resource-policy', {
+      method: 'PUT', signal, cache: 'no-store',
+      body: JSON.stringify({ allow_ai: allow, boot_id: boot, expected_revision: revision }),
+    }, 'json', false)),
+  release: async (boot: string, revision: number, request: string, mode: 'graceful' | 'immediate', signal?: AbortSignal) =>
+    validateResourcePolicy(await apiCall<unknown>('/resource-policy/release', {
+      method: 'POST', signal, cache: 'no-store',
+      body: JSON.stringify({ boot_id: boot, expected_revision: revision, request_id: request, mode }),
+    }, 'json', false)),
+};
+
+export const resourcesApi = {
+  get: (signal?: AbortSignal) => apiCall<ResourceSnapshot>('/resources', { signal, cache: 'no-store' }),
+};
+
+const testPath = (name: string, id?: string) => `/instances/${encodeURIComponent(name)}/tests${id ? `/${encodeURIComponent(id)}` : ''}`;
+export const deploymentTestsApi = {
+  control: (name: string, signal?: AbortSignal) => apiCall<ControlSnapshot>(`/instances/${encodeURIComponent(name)}/control`, { signal, cache: 'no-store' }),
+  run: (name: string, body: DeploymentTestRequest, signal?: AbortSignal) => apiCall<DeploymentTest>(testPath(name), { method: 'POST', body: JSON.stringify(body), signal }),
+  get: (name: string, id: string, signal?: AbortSignal) => apiCall<DeploymentTest>(testPath(name, id), { signal, cache: 'no-store' }),
+  cancel: (name: string, id: string, body: TestEnvelope) => apiCall<DeploymentTest>(`${testPath(name, id)}/cancel`, { method: 'POST', body: JSON.stringify(body) }),
+  export: (name: string, id: string, format: 'json' | 'csv') => apiCall<string>(`${testPath(name, id)}?format=${format}`, { cache: 'no-store' }, 'text'),
+};
 
 // Server API functions (moved to llama-cpp backend)
 export const serverApi = {

@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -260,6 +261,22 @@ func TestOwnerPolicyRejectsRealInferenceKey(t *testing.T) {
 		router.ServeHTTP(w, r)
 		if w.Code != 200 || g.Snapshot().AllowAI {
 			t.Fatalf("owner session rejected: %d %s", w.Code, w.Body.String())
+		}
+		paused := g.Snapshot()
+		release := releaseBody(paused, "session-release", "immediate")
+		r = httptest.NewRequest("POST", "/api/v1/resource-policy/release", strings.NewReader(release))
+		r.Header.Set("Authorization", "Bearer synthetic-inference-key")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		if w.Code != 401 || !reflect.DeepEqual(g.Snapshot(), paused) {
+			t.Fatal("allow_all inference key gained force authority")
+		}
+		r = httptest.NewRequest("POST", "/api/v1/resource-policy/release", strings.NewReader(release))
+		r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: sess.ID})
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		if w.Code != 202 {
+			t.Fatalf("owner release session rejected: %d %s", w.Code, w.Body.String())
 		}
 	}
 }

@@ -72,6 +72,9 @@ func (l *logger) create() error {
 		t.MaxSize = 0
 	}
 
+	// A replacement must not leave the previous file open. Output readers carry
+	// their original file identity and cannot append after this close.
+	l.closeLocked(l.logFile)
 	l.logFile = t
 
 	// Write a startup marker
@@ -81,36 +84,75 @@ func (l *logger) create() error {
 	return nil
 }
 
+// startOutput captures the log generation before scheduling either reader. Its
+// cleanup closes only those pipes, joins both readers, then closes that log.
+func (l *logger) startOutput(readers ...io.ReadCloser) func() {
+	l.mu.RLock()
+	lg := l.logFile
+	l.mu.RUnlock()
+	var wg sync.WaitGroup
+	for _, rc := range readers {
+		wg.Add(1)
+		go func() { defer wg.Done(); l.readOutputGeneration(rc, lg) }()
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for _, rc := range readers {
+				_ = rc.Close()
+			}
+			wg.Wait()
+			l.mu.Lock()
+			defer l.mu.Unlock()
+			l.closeLocked(lg)
+		})
+	}
+}
+
 func (l *logger) readOutput(rc io.ReadCloser) {
+	l.mu.RLock()
+	lg := l.logFile
+	l.mu.RUnlock()
+	l.readOutputGeneration(rc, lg)
+}
+
+func (l *logger) readOutputGeneration(rc io.ReadCloser, lg *timber.Logger) {
 	defer rc.Close()
 	scanner := bufio.NewScanner(rc)
 	for scanner.Scan() {
-		line := scanner.Text()
-		if lg := l.logFile; lg != nil {
-			fmt.Fprintln(lg, line)
+		l.mu.RLock()
+		if lg != nil && l.logFile == lg {
+			fmt.Fprintln(lg, scanner.Text())
 		}
+		l.mu.RUnlock()
 	}
 	if err := scanner.Err(); err != nil {
-		if lg := l.logFile; lg != nil {
+		l.mu.RLock()
+		if lg != nil && l.logFile == lg {
 			fmt.Fprintf(lg, "\n=== Error reading output for instance %s: %v ===\n", l.name, err)
 		}
+		l.mu.RUnlock()
 	}
 }
 
 func (l *logger) close() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.closeLocked(l.logFile)
+}
 
-	lg := l.logFile
+// Caller holds mu exclusively. Never write a stop marker through a stale timber
+// logger: Write could reopen its closed file. A stale close cannot clear the new log.
+func (l *logger) closeLocked(lg *timber.Logger) {
 	if lg == nil {
 		return
 	}
-
-	ts := time.Now().Format("2006-01-02 15:04:05")
-	fmt.Fprintf(lg, "=== Instance %s stopped at %s ===\n\n", l.name, ts)
-
+	if l.logFile == lg {
+		ts := time.Now().Format("2006-01-02 15:04:05")
+		fmt.Fprintf(lg, "=== Instance %s stopped at %s ===\n\n", l.name, ts)
+		l.logFile = nil
+	}
 	_ = lg.Close()
-	l.logFile = nil
 }
 
 // getLogs retrieves the last n lines of logs from the instance
