@@ -538,6 +538,18 @@ func (im *instanceManager) RecoverControl(ctx context.Context, name, boot string
 	if c.closed {
 		return instance.ControlSnapshot{}, protocolError("manager_stopping")
 	}
+	if boot != c.boot {
+		return instance.ControlSnapshot{}, protocolError("epoch_changed")
+	}
+	if inst.ControlSnapshot().Revision != revision {
+		return instance.ControlSnapshot{}, protocolError("revision_conflict")
+	}
+	if handled, recoveryErr := im.recoverN1(ctx, inst); handled {
+		if recoveryErr != nil {
+			return instance.ControlSnapshot{}, recoveryErr
+		}
+		return inst.ControlSnapshot(), nil
+	}
 	lease, err := inst.BeginControl(boot, revision, false, true)
 	if err != nil {
 		return instance.ControlSnapshot{}, err

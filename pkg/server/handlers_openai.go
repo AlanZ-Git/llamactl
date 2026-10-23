@@ -161,7 +161,30 @@ func (h *Handler) OpenAIListInstances() http.HandlerFunc {
 // @Router /v1/ [post]
 func (h *Handler) OpenAIProxy() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Read the entire body first
+		// The one configured N1 Router is known before reading the body. Bind its
+		// use/owner deadline first; a trickled aggregate body cannot outlive a use.
+		if r.Header.Get("X-Service-Use") != "" {
+			inst, err := h.InstanceManager.GetInstance(h.cfg.N1.Instance)
+			if err != nil {
+				writeError(w, 409, "use_invalid", "N1 Router unavailable")
+				return
+			}
+			if _, err = h.authMiddleware.ResolveInstancePermission(r.Context(), inst.ID); err != nil {
+				writeError(w, 403, "permission_denied", err.Error())
+				return
+			}
+			if !h.authorizeN1Inference(w, r, inst) {
+				return
+			}
+			release, err := inst.PrepareInferenceRequest(r, w)
+			if err != nil {
+				status, code, _ := instance.AdmissionHTTPError(err)
+				writeError(w, status, code, err.Error())
+				return
+			}
+			defer release()
+		}
+		// Read the validated body, or the legacy body for non-service requests.
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", "Failed to read request body")
@@ -221,6 +244,9 @@ func (h *Handler) OpenAIProxy() http.HandlerFunc {
 		// or shrink whitespace. Hold use through final forwarding/mode checks.
 		r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		r.ContentLength = int64(len(bodyBytes))
+		if !h.authorizeN1Inference(w, r, inst) {
+			return
+		}
 		release, err := inst.PrepareInferenceRequest(r)
 		if err != nil {
 			status, code, _ := instance.AdmissionHTTPError(err)
@@ -257,6 +283,15 @@ func (h *Handler) OpenAIProxy() http.HandlerFunc {
 			}
 		}
 
+		// Service admission may fill the fixed generation/prompt contract. Rewrite
+		// only the model in those admitted bytes, not in the earlier client body.
+		if r.Header.Get("X-Service-Use") != "" {
+			admitted, readErr := io.ReadAll(r.Body)
+			if readErr != nil || json.Unmarshal(admitted, &requestBody) != nil {
+				writeError(w, 422, "invalid_request", "invalid admitted body")
+				return
+			}
+		}
 		// Update the request body with the actual model name
 		requestBody["model"] = modelName
 

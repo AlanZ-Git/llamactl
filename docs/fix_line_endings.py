@@ -41,6 +41,7 @@ def on_page_markdown(markdown, page, config, **kwargs):
         # - YAML front matter and HTML tags
         # - Standalone punctuation lines
         if (stripped.startswith('#') or 
+            stripped.startswith('--8<--') or  # Preserve pymdownx.snippets directives verbatim
             stripped.startswith('>') or
             '|' in stripped or
             line.endswith('  ') or

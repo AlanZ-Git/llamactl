@@ -8,20 +8,28 @@ Llamactl controls access with three mechanisms:
 
 The rest of this page covers **inference API keys** and their per-instance permissions, followed by **SSO setup**.
 
+The lifecycle/access-level rules below describe **ordinary instances**. Controlled instances never auto-start on inference;
+protocol-enabled `control` instances require operations/ready identities, and N1 adds explicit per-instance capabilities
+and service-use ownership. `allow_all` or a management key does not bypass controlled admission, owner pause, or protocol guards.
+See [client permissions](client-integration.zh-CN.md#client-permissions),
+[control/N1](control-api.zh-CN.md) and [owner authority](resource-policy.md#owner-http-contract).
+
 ## Inference API Keys
 
 ### Permission Modes
 
 When you create an inference key, you choose a permission mode:
 
-- **Full Access** (`allow_all`): The key can use every instance with full lifecycle rights. This is the simplest option.
+- **Full Access** (`allow_all`): Broad ordinary-instance inference/start/eviction rights; not management or owner authority. Prefer explicit per-instance rights for clients.
 - **Per-Instance Access** (`per_instance`): You explicitly grant access to specific instances and choose an access level for each.
 
-Management API keys bypass all permission checks entirely.
+Management API keys have administrative scope, but do not bypass lifecycle/admission/recovery guards.
+Owner policy requires an explicitly configured management key or valid owner/OIDC session, not a fallback key.
 
 ### Access Levels
 
-For each instance granted to a per-instance key, you pick one of three access levels. A key can always **use a running instance** — the level only affects what happens when the instance is **stopped** at request time.
+For each ordinary instance granted to a per-instance key, choose one of three access levels. A running ordinary instance
+can be used subject to admission; these levels control stopped-instance behavior. Controlled/N1 use also needs its protocol identities and permissions.
 
 | Level | What the key can do |
 |---|---|
@@ -119,7 +127,7 @@ curl -X DELETE http://localhost:8080/api/v1/auth/keys/{id} \
 
 ### Use Cases
 
-- **Production vs. development**: Give production keys *Can start and evict* so requests always succeed; give development keys *Can start on demand* so they never disrupt production workloads.
+- **Ordinary-instance consumers**: Grant start/eviction only when intended; these rights do not guarantee request success or capacity.
 - **Read-only consumers**: Use *Use running only* for dashboards or monitoring tools that should reuse a warm instance but never spin one up.
 - **Shared clusters**: Limit disruptive eviction rights to a small set of trusted keys so noisy neighbors can't evict each other's models.
 

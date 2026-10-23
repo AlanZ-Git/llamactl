@@ -396,7 +396,7 @@ func (h *Handler) InstanceProxy() http.HandlerFunc {
 		r.Header.Set("X-Forwarded-Proto", "http")
 
 		// Use instance's ServeHTTP which tracks inflight requests and handles shutting down state
-		err = inst.ServeHTTP(w, r)
+		err = h.serveN1Aware(inst, w, r)
 		if err != nil {
 			// Error is already handled in ServeHTTP (response written)
 			return

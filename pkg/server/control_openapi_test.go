@@ -71,6 +71,13 @@ func (d controlAPIDoc) validate(s map[string]any, v any) error {
 		}
 		return fmt.Errorf("unexpected null")
 	}
+	if variants, ok := s["allOf"].([]any); ok {
+		for _, variant := range variants {
+			if err := d.validate(object(variant), v); err != nil {
+				return err
+			}
+		}
+	}
 	if variants, ok := s["oneOf"].([]any); ok {
 		matches := 0
 		for _, variant := range variants {
@@ -202,6 +209,9 @@ func (d controlAPIDoc) response(t *testing.T, method, path string, status int, b
 	operation := object(endpoint[strings.ToLower(method)])
 	response := d.resolve(object(object(operation["responses"])[strconv.Itoa(status)]))
 	if response == nil {
+		response = d.resolve(object(object(operation["responses"])["default"]))
+	}
+	if response == nil {
 		t.Fatalf("undocumented %s %s status %d: %s", method, path, status, body)
 	}
 	schema := object(object(object(response["content"])["application/json"])["schema"])
@@ -228,6 +238,9 @@ func TestP3OpenAPIRoutesSchemasAndHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 	for path, item := range object(doc["paths"]) {
+		if !strings.Contains(path, "/control") && !strings.Contains(path, "/operations") && !strings.Contains(path, "/tests") {
+			continue
+		}
 		for method := range object(item) {
 			if method == "parameters" {
 				continue

@@ -2,6 +2,10 @@
 
 This guide will walk you through installing Llamactl on your system.
 
+For this fork's controlled/N1 features, use the [Windows/Linux workstation guide](workstation-deployment.zh-CN.md).
+The upstream releases and Docker images below do not establish that a customized artifact has been published.
+Use the maintainer-specified source revision/artifact digest; do not substitute upstream latest.
+
 ## Prerequisites
 
 ### Backend Dependencies
@@ -134,8 +138,9 @@ docker run -d \
 ### Option 3: Build from Source
 
 Requirements:
-- Go 1.24 or later
-- Node.js 22 or later
+- Go 1.26 (see `go.mod`)
+- Node.js 22.12+ (Node 22 line used by the release workflow)
+- A target C compiler and `CGO_ENABLED=1` for SQLite
 - Git
 
 If you prefer to build from source:
@@ -149,7 +154,7 @@ cd llamactl
 cd webui && npm ci && npm run build && cd ..
 
 # Build the application
-go build -o llamactl ./cmd/server
+CGO_ENABLED=1 go build -o llamactl ./cmd/server
 ```
 
 ## Remote Node Installation
@@ -169,6 +174,8 @@ llamactl --version
 
 ## Next Steps
 
-Now that Llamactl is installed, continue to the [Quick Start](quick-start.md) guide to get your first instance running!
+For ordinary instances, continue to [Quick Start](quick-start.md).
+For controlled/N1 instances, continue to [workstation initialization](workstation-deployment.zh-CN.md#instance-setup)
+and the [client guide](client-integration.zh-CN.md); ordinary UI/autostart instructions are not substitutes.
 
 For remote node deployments, see the [Configuration Guide](configuration.md) for node setup instructions.

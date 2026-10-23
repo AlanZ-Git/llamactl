@@ -1,11 +1,15 @@
 openapi: 3.0.3
 info:
-  title: Llamactl finite Router control and deployment tests
-  version: p3c/1
+  title: Llamactl finite Router control, durable evaluation and recipe service use
+  version: n1/1
   description: >-
     Additive instance control contract. A single local protocol-enabled llama.cpp
     Router; not a task scheduler. GET has no engine/inference side effects.
     Authentication is mandatory. See control-api.zh-CN.md for recovery and inference.
+    N1 paths and inference bindings apply only when that optional extension is
+    deployed and configured; a 403 may mean insufficient capability, not absence.
+    N1 handler bodies are limited to 1MiB unencoded strict JSON. Legacy control
+    remains p3a/1; info.version is not a runtime capability-negotiation response.
 security:
   - bearerAuth: []
   - apiKeyAuth: []
@@ -211,12 +215,566 @@ paths:
         '422': { $ref: '#/components/responses/Error' }
         '429': { $ref: '#/components/responses/Error' }
         '503': { $ref: '#/components/responses/Error' }
+  /api/v1/instances/{name}/inventory:
+    parameters: &n1Instance
+      - $ref: '#/components/parameters/InstanceName'
+    get:
+      summary: discover capability; approved root IDs only, no loading
+      responses:
+        '200':
+          description: Approved roots (not a filesystem path list)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roots, boot_id, revision]
+                properties:
+                  roots: {type: array, items: {type: string}}
+                  boot_id: {type: string, description: Current envelope identity without legacy controller authority}
+                  revision: {type: integer, minimum: 0}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/inventory/scans:
+    parameters: *n1Instance
+    post:
+      summary: discover; start root or single-basename scan, or continue a partial scan
+      description: >-
+        Optional filename selects exactly one file under the approved root_id without
+        enumerating or parsing siblings. Missing/empty filename retains the recursive root
+        scan. No paths, separators, traversal, drive/ADS colon, NUL, leading dot or trailing
+        dot/space; directories are rejected with 422 invalid_config. Links remain explicit
+        blocked_link candidates, missing targets unreadable/stat_failed, malformed metadata
+        invalid/gguf_structure_invalid. A named split without siblings in the snapshot is
+        incomplete; there is no implicit root-scan fallback. Continuation retains its original
+        selection: omit/empty filename or repeat it exactly; conflicting filename returns
+        422 invalid_config without consuming the cursor.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                root_id: {type: string, minLength: 1}
+                filename:
+                  type: string
+                  default: ''
+                  pattern: '^(|[^./\\:\x00 ]|[^./\\:\x00][^/\\:\x00]*[^/\\:\x00. ])$'
+                  description: Single portable basename, not a path; empty selects root scan only on a new scan
+                scan_id: {type: string, minLength: 1}
+                continuation: {type: string, minLength: 1}
+              anyOf:
+                - required: [root_id]
+                - required: [scan_id, continuation]
+            example: {root_id: fixture, filename: synthetic.gguf}
+      responses: &n1ScanResponses
+        '200':
+          description: Frozen snapshot; partial requires continuation, next is page offset
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1Scan'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/inventory/scans/{scan_id}:
+    parameters:
+      - $ref: '#/components/parameters/InstanceName'
+      - {name: scan_id, in: path, required: true, schema: {type: string}}
+      - {name: offset, in: query, schema: {type: integer, minimum: 0, default: 0}}
+      - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 1000, default: 100}}
+    get:
+      summary: discover; page a frozen scan, never rescan implicitly
+      responses: *n1ScanResponses
+  /api/v1/instances/{name}/inventory/verify:
+    parameters: *n1Instance
+    post:
+      summary: evaluate; bounded metadata parsing and first/changed full content hash
+      description: >-
+        Verifies member identity and metadata/split consistency, not tensor quantization
+        support, payload geometry, alignment, weight integrity or engine loadability.
+        Unknown tensor types and truncated weight tails can be identity-verified when
+        bounded metadata/descriptors remain readable. Malformed/truncated metadata and
+        descriptor bounds remain rejected. No engine is started or contacted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: '#/components/schemas/N1ArtifactRequest'}
+                - type: object
+                  required: [scan_id, candidate_id]
+      responses:
+        '200':
+          description: Verified content identity; no load or quality claim
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1Artifact'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/inventory/register:
+    parameters: *n1Instance
+    post:
+      summary: evaluate; register verified artifact under maintenance and revision CAS
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: '#/components/schemas/N1ArtifactRequest'}
+                - type: object
+                  required: [artifact_id]
+      responses:
+        '200':
+          description: Synchronous durable registration operation, no autoload
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [artifact_id, revision, state, operation_id]
+                properties:
+                  artifact_id: {type: string}
+                  revision: {type: integer}
+                  state: {type: string, enum: [registered]}
+                  operation_id: {type: string}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/recipes:
+    parameters: *n1Instance
+    get:
+      summary: discover; descriptions and immutable versions, not a recommendation
+      parameters:
+        - {name: published, in: query, schema: {type: boolean}}
+        - {name: verified, in: query, schema: {type: boolean}}
+        - {name: task, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: Recipe catalogue; effective_available is checked against local identity
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recipes]
+                properties:
+                  recipes: {type: array, items: {$ref: '#/components/schemas/N1RecipeView'}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      summary: recipe_write; create immutable draft, or next version using recipe_id/expected_version
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/N1Recipe'}
+      responses: &n1RecipeCreated
+        '201':
+          description: Immutable draft record, not published or loaded
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1RecipeRecord'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/recipes/{recipe_id}/versions/{version}:
+    parameters: &n1RecipePath
+      - $ref: '#/components/parameters/InstanceName'
+      - {name: recipe_id, in: path, required: true, schema: {type: string}}
+      - {name: version, in: path, required: true, schema: {type: integer, minimum: 1}}
+    get:
+      summary: discover; read a specific immutable recipe
+      responses:
+        '200':
+          description: Recipe and current publication/applicability
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1RecipeView'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/recipes/{recipe_id}/versions/{version}/publish:
+    parameters: *n1RecipePath
+    post: &n1Publication
+      summary: recipe_publish; publish requires local identity, engine and immutable findings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_version, conclusion_level]
+              properties:
+                expected_version: {type: integer, minimum: 1}
+                conclusion_level: {type: string, enum: [synthetic_only, business_validated]}
+      responses:
+        '200':
+          description: Audited publication state; never switches service
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [recipe_id, version, publication_state]
+                properties:
+                  recipe_id: {type: string}
+                  version: {type: integer}
+                  publication_state: {type: string, enum: [published, withdrawn]}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/recipes/{recipe_id}/versions/{version}/withdraw:
+    parameters: *n1RecipePath
+    post:
+      <<: *n1Publication
+      summary: recipe_publish; withdraw without deleting immutable evidence
+  /api/v1/instances/{name}/recipes/{recipe_id}/versions/{version}/export:
+    parameters: *n1RecipePath
+    get:
+      summary: discover; portable schema_version=1 snapshot without paths, credentials or tokens
+      responses:
+        '200':
+          description: Immutable snapshot; foreign validation cannot be imported as local
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1RecipeExport'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/recipes/import:
+    parameters: *n1Instance
+    post:
+      summary: recipe_write; explicit dry-run then draft commit, optional fork as_new
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [dry_run, snapshot]
+              properties:
+                dry_run: {type: boolean}
+                as_new: {type: boolean, default: false}
+                snapshot: {$ref: '#/components/schemas/N1RecipeExport'}
+      responses:
+        <<: *n1RecipeCreated
+        '200':
+          description: Preview or same-identity idempotent existing record
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dry_run: {type: boolean}
+                  resolved: {type: boolean}
+                  publication_state: {type: string}
+                  idempotent: {type: boolean}
+                  recipe:
+                    oneOf:
+                      - {$ref: '#/components/schemas/N1Recipe'}
+                      - {$ref: '#/components/schemas/N1RecipeRecord'}
+        '409':
+          description: Authorized conflict summary, never overwrite
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                description: Existing/imported digests are included only with discover or administrator read authority.
+                additionalProperties: {type: string}
+  /api/v1/instances/{name}/evaluation-runs:
+    parameters: *n1Instance
+    get: &n1ListRuns
+      summary: Own durable history; key+accepted_boot reconciles lost acceptance without replay
+      parameters:
+        - {name: key, in: query, schema: {type: string}}
+        - {name: accepted_boot, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: Key lookup returns run view; without key returns latest at most 256 records
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - {$ref: '#/components/schemas/N1Run'}
+                  - type: object
+                    required: [runs]
+                    properties:
+                      runs: {type: array, items: {$ref: '#/components/schemas/N1Run'}}
+        default: {$ref: '#/components/responses/Error'}
+    post:
+      summary: evaluate; persist bounded immutable manifest before any effects
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/N1Evaluation'}
+      responses: &n1Accepted
+        '202':
+          description: Accepted or original durable run; not ready or successful
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1Run'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/evaluation-runs/{id}:
+    parameters: &n1RunPath
+      - $ref: '#/components/parameters/InstanceName'
+      - {name: id, in: path, required: true, schema: {type: string}}
+    get: &n1GetRun
+      summary: Own run and immutable events; history readable across boot
+      responses: &n1RunResponses
+        '200':
+          description: Execution, cleanup and analysis are separate axes
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1Run'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/evaluation-runs/{id}/attempts:
+    parameters: *n1RunPath
+    post:
+      summary: evaluate; serial durable dispatch intent and budget reservation, never arbitrary forwarding
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/N1Attempt'}
+      responses:
+        '202':
+          description: Immutable dispatch event, not a generation receipt
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1Event'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/evaluation-runs/{id}/attempts/{seq}:
+    parameters: &n1AttemptPath
+      - $ref: '#/components/parameters/InstanceName'
+      - {name: id, in: path, required: true, schema: {type: string}}
+      - {name: seq, in: path, required: true, schema: {type: integer, minimum: 1}}
+    get:
+      summary: Authenticated repeat GET does not consume body; no regeneration on missing output
+      responses:
+        '200':
+          description: Default delivery TTL 300s, body 1MiB/run 16MiB maximum, administrator may narrow
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1Delivery'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/evaluation-runs/{id}/attempts/{seq}/ack:
+    parameters: *n1AttemptPath
+    post:
+      summary: evaluate; idempotent digest ACK removes delivery buffer, not execution receipt
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [digest]
+              properties:
+                digest: {type: string, pattern: '^[a-f0-9]{64}$'}
+      responses:
+        '200':
+          description: ACK persisted; explicit retained output remains retrievable
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [acknowledged]
+                properties:
+                  acknowledged: {type: boolean, enum: [true]}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/evaluation-runs/{id}/analysis:
+    parameters: *n1RunPath
+    post:
+      summary: evaluate; external findings after cleanup freezes receipts, report window 24h
+      description: Crossboot evidence upload allowed; same version/payload idempotent, different payload 409. Corrections use new analysis_version and supersedes event seq. Never loads a model.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/N1Findings'}
+      responses:
+        '200':
+          description: Immutable findings event with server-recomputed digest
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/N1Event'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/evaluation-runs/{id}/finish:
+    parameters: *n1RunPath
+    post: &n1Safety
+      summary: Own safe cleanup; current boot/key required, stale revision and exhaustion do not block
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/N1Envelope'}
+      responses: *n1RunResponses
+  /api/v1/instances/{name}/evaluation-runs/{id}/cancel:
+    parameters: *n1RunPath
+    post: *n1Safety
+  /api/v1/instances/{name}/evaluation-runs/{id}/heartbeat:
+    parameters: *n1RunPath
+    post:
+      <<: *n1Safety
+      summary: evaluate; own finite heartbeat, never extends absolute deadline
+  /api/v1/instances/{name}/service-uses:
+    parameters: *n1Instance
+    get: *n1ListRuns
+    post:
+      summary: service_use; explicit published recipe/version switch, persisted before effects
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/N1Use'}
+      responses: *n1Accepted
+  /api/v1/instances/{name}/service-uses/{id}:
+    parameters: *n1RunPath
+    get: *n1GetRun
+  /api/v1/instances/{name}/service-uses/{id}/release:
+    parameters: *n1RunPath
+    post: *n1Safety
+  /api/v1/instances/{name}/service-uses/{id}/renew:
+    parameters: *n1RunPath
+    post:
+      <<: *n1Safety
+      summary: service_use; update idle duration, never beyond original absolute deadline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - {$ref: '#/components/schemas/N1Envelope'}
+                - type: object
+                  properties:
+                    idle_seconds: {type: integer, minimum: 0, maximum: 300, default: 60, description: Omitted or zero selects 60 seconds; does not revive expired use}
+  /api/v1/instances/{name}/observation:
+    parameters: *n1Instance
+    get:
+      summary: observe; existing shared sampler whole-host cache, no private process list
+      responses:
+        '200':
+          description: Sampler snapshot or available=false with reason; missing metrics are not zero
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  available: {type: boolean}
+                  reason: {type: string}
+                  sampled_at: {type: string, format: date-time}
+                  stale: {type: boolean}
+                  cpu: {type: object}
+                  memory: {type: object}
+                  gpu: {type: object}
+                  processes: {type: array, nullable: true, items: {type: object}}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/instances/{name}/capabilities/{key_id}:
+    parameters:
+      - $ref: '#/components/parameters/InstanceName'
+      - {name: key_id, in: path, required: true, schema: {type: integer, minimum: 1}}
+    put:
+      summary: Administrator replaces capability set; live revoked work is proactively cleaned
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [capabilities]
+              properties:
+                capabilities: {type: array, items: {$ref: '#/components/schemas/N1Capability'}}
+      responses:
+        '200':
+          description: Capability rows saved; old controller has no automatic new capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [key_id, instance_id, capabilities]
+                properties:
+                  key_id: {type: integer}
+                  instance_id: {type: integer}
+                  capabilities: {type: array, items: {$ref: '#/components/schemas/N1Capability'}}
+        default: {$ref: '#/components/responses/Error'}
+  /v1/chat/completions:
+    post: &n1Inference
+      summary: Existing inference entrance; N1 service use additionally binds prompt and ready identity
+      description: >-
+        Inference capability plus existing instance inference permission and same use owner.
+        model is instance/artifact_id here, artifact_id at the native and instance proxy entrances.
+        Generation controls omitted by the caller are filled from the recipe; supplied controls
+        must match exactly. All internal binding headers are consumed and stripped before backend.
+        Request body is bounded to 1MiB under min(request timeout, use absolute deadline), without
+        admission locks across I/O. Response identity is captured at atomic admission, not late state.
+        Ordinary inference has no durable exactly-once guarantee and must not be blindly replayed.
+      parameters:
+        - {name: X-Service-Use, in: header, required: true, schema: {type: string}}
+        - {name: X-Ready-Token, in: header, required: true, schema: {type: string}}
+        - {name: X-Prompt-Template-Version, in: header, required: true, schema: {type: string}}
+        - name: X-Prompt-Digest
+          in: header
+          required: true
+          schema: {type: string, pattern: '^[a-f0-9]{64}$'}
+          description: SHA256 of canonical JSON object with system_prefix and template_version; returned by service-use GET. Exactly one value per binding header.
+        - {name: X-Request-Timeout-Seconds, in: header, schema: {type: integer, minimum: 1, maximum: 600, default: 600}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [model, messages]
+              properties:
+                model: {type: string}
+                messages:
+                  type: array
+                  minItems: 1
+                  maxItems: 256
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [role, content]
+                    properties:
+                      role: {type: string, enum: [system, user, assistant]}
+                      content: {type: string}
+                stream: {type: boolean}
+                max_tokens: {type: integer}
+                temperature: {type: number}
+                top_p: {type: number}
+                top_k: {type: integer}
+                min_p: {type: number}
+                seed: {type: integer}
+                chat_template_kwargs:
+                  type: object
+                  additionalProperties: false
+                  required: [enable_thinking]
+                  properties:
+                    enable_thinking: {type: boolean}
+            example: {model: router/artifact-id, messages: [{role: user, content: synthetic test}]}
+      responses:
+        '200':
+          description: Backend response/SSE, not automatically quality success
+          headers:
+            X-Recipe-ID: {schema: {type: string}}
+            X-Recipe-Version: {schema: {type: integer}}
+            X-Boot-ID: {schema: {type: string}}
+            X-Config-Revision: {schema: {type: integer}}
+            X-Process-Generation: {schema: {type: integer}}
+            X-Load-Generation: {schema: {type: integer}}
+            X-Prompt-Template-Version: {schema: {type: string}}
+            X-Prompt-Digest: {schema: {type: string}}
+          content:
+            application/json: {schema: {type: object}}
+            text/event-stream: {schema: {type: string}}
+        default: {$ref: '#/components/responses/Error'}
+  /llama-cpp/{name}/v1/chat/completions:
+    parameters: *n1Instance
+    post: *n1Inference
+  /api/v1/instances/{name}/proxy/v1/chat/completions:
+    parameters: *n1Instance
+    post: *n1Inference
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Scoped-controller or management key; ready token is not authentication
+      description: >-
+        Scoped-controller or management key; ready token is not authentication.
+        N1 keys require per-instance capabilities; inference also requires existing
+        instance inference permission and the same service-use owner scope.
     apiKeyAuth:
       type: apiKey
       in: header
@@ -234,6 +792,352 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ControlError' }
   schemas:
+    N1Capability:
+      type: string
+      enum: [discover, evaluate, recipe_write, recipe_publish, service_use, inference, observe]
+    N1Envelope:
+      type: object
+      required: [boot_id, expected_revision, idempotency_key]
+      properties:
+        boot_id: {type: string, minLength: 1}
+        expected_revision: {type: integer, minimum: 0}
+        idempotency_key: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_.-]+$'}
+    N1RequestContract:
+      type: object
+      additionalProperties: false
+      required: [parameters, template_version]
+      description: >-
+        Exact generation constraints are filled if missing, otherwise must match.
+        null and duplicates are rejected at all nesting levels. system_prefix defaults
+        to empty. Nonempty prefix is inserted as first system message or must match
+        the supplied first system message exactly. No backend template override.
+      properties:
+        template_version: {type: string, minLength: 1, maxLength: 128}
+        system_prefix: {type: string, maxLength: 16384, default: ''}
+        parameters:
+          type: object
+          additionalProperties: false
+          required: [max_tokens]
+          properties:
+            max_tokens: {type: integer, minimum: 1, maximum: 32768}
+            temperature: {type: number, minimum: 0, maximum: 2}
+            top_p: {type: number, minimum: 0, maximum: 1}
+            min_p: {type: number, minimum: 0, maximum: 1}
+            top_k: {type: integer, minimum: 0, maximum: 1000}
+            seed: {type: integer, minimum: 0, maximum: 2147483647}
+            chat_template_kwargs:
+              type: object
+              additionalProperties: false
+              required: [enable_thinking]
+              properties:
+                enable_thinking: {type: boolean}
+      example:
+        template_version: synthetic-v1
+        system_prefix: synthetic only
+        parameters: {max_tokens: 8, temperature: 0, chat_template_kwargs: {enable_thinking: false}}
+    N1Candidate:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, artifact_id, artifact_manifest_digest, deployment, request]
+      properties:
+        candidate_id: {type: string, minLength: 1, maxLength: 128}
+        artifact_id: {type: string}
+        artifact_manifest_digest: {type: string}
+        deployment: {$ref: '#/components/schemas/ControlPatch'}
+        request: {$ref: '#/components/schemas/N1RequestContract'}
+    N1Budget:
+      type: object
+      additionalProperties: false
+      required: [requests, tokens, bytes]
+      properties:
+        requests: {type: integer, minimum: 1, maximum: 256}
+        tokens: {type: integer, minimum: 1, maximum: 1048576}
+        bytes: {type: integer, minimum: 1, maximum: 16777216}
+        reserved_requests: {type: integer, minimum: 0, readOnly: true}
+        reserved_tokens: {type: integer, minimum: 0, readOnly: true}
+        reserved_bytes: {type: integer, minimum: 0, readOnly: true}
+      description: Defaults are maxima 64 requests/32768 tokens/16MiB; local admin may narrow or configure within absolute caps. Reservations never refunded on unknown usage.
+    N1Evaluation:
+      allOf:
+        - {$ref: '#/components/schemas/N1Envelope'}
+        - type: object
+          required: [candidates, wall_seconds, attempt_seconds, cleanup_seconds, budget, notice_ref, not_before, fixture_version, purpose, parameter_ranges]
+          properties:
+            candidates: {type: array, minItems: 1, maxItems: 64, items: {$ref: '#/components/schemas/N1Candidate'}}
+            wall_seconds: {type: integer, minimum: 2, maximum: 1800}
+            attempt_seconds: {type: integer, minimum: 2, maximum: 1800}
+            cleanup_seconds: {type: integer, minimum: 1, maximum: 30}
+            budget: {$ref: '#/components/schemas/N1Budget'}
+            notice_ref: {type: string, minLength: 1, maxLength: 512}
+            not_before: {type: integer, description: Unix milliseconds, must already have passed}
+            fixture_version: {type: string, minLength: 1}
+            purpose: {type: string, enum: [synthetic_only]}
+            parameter_ranges:
+              type: object
+              additionalProperties: {type: array, minItems: 2, maxItems: 2, items: {type: integer}}
+            retain_outputs: {type: boolean, default: false}
+      description: Strict fields only. attempt_seconds must exceed cleanup_seconds and not exceed wall_seconds. Every integer deployment parameter must be covered by declared min/max. Synthetic fixture authorization is not a real-load notice.
+    N1Attempt:
+      allOf:
+        - {$ref: '#/components/schemas/N1Envelope'}
+        - type: object
+          required: [seq, candidate_id, fixture_id, fixture_digest, messages]
+          properties:
+            seq: {type: integer, minimum: 1, maximum: 256}
+            candidate_id: {type: string}
+            fixture_id: {type: string, minLength: 1}
+            fixture_digest: {type: string, description: SHA256 of canonical messages JSON}
+            messages:
+              type: array
+              minItems: 1
+              maxItems: 256
+              items:
+                type: object
+                additionalProperties: false
+                required: [role, content]
+                properties:
+                  role: {type: string, enum: [system, user, assistant]}
+                  content: {type: string}
+    N1Use:
+      allOf:
+        - {$ref: '#/components/schemas/N1Envelope'}
+        - type: object
+          required: [recipe_id, version]
+          properties:
+            recipe_id: {type: string}
+            version: {type: integer, minimum: 1}
+            idle_seconds: {type: integer, minimum: 0, maximum: 300, default: 60}
+      description: Absolute use deadline at most 30 minutes, administrator may narrow. Zero/omitted idle selects 60. Active SSE is not an idle gap. closing rejects admission; cleanup must finish before another use.
+    N1Scan:
+      type: object
+      additionalProperties: false
+      required: [scan_id, root_id, candidates, partial]
+      properties:
+        scan_id: {type: string}
+        root_id: {type: string}
+        filename: {type: string, description: Original single-basename selection; absent for full-root scans, retained across pages and continuations}
+        partial: {type: boolean}
+        continuation: {type: string}
+        next: {type: integer, minimum: 0}
+        candidates:
+          type: array
+          items:
+            type: object
+            required: [candidate_id, name, file_state, metadata, members]
+            properties:
+              candidate_id: {type: string}
+              name: {type: string, description: Root-relative member, never an absolute path}
+              file_state: {type: string}
+              reason: {type: string}
+              metadata: {type: object}
+              members: {type: array, nullable: true, items: {type: string}}
+    N1ArtifactRequest:
+      allOf:
+        - {$ref: '#/components/schemas/N1Envelope'}
+        - type: object
+          anyOf:
+            - required: [scan_id, candidate_id]
+            - required: [artifact_id]
+          properties:
+            scan_id: {type: string}
+            candidate_id: {type: string}
+            projector_id: {type: string, description: Explicit same-scan auxiliary association; never inferred from name}
+            artifact_id: {type: string, description: Required for register; verify uses scan_id/candidate_id}
+    N1Artifact:
+      type: object
+      description: >-
+        identity_level=verified and file_state=complete mean content/member identity and
+        metadata consistency only. Registration is no-load and does not certify weights,
+        engine compatibility, readiness or quality. Load failures belong to evaluation
+        attempt receipts or service-use terminal state; inspect cleanup separately.
+      required: [artifact_id, root_id, relative_main, ordered_members, metadata, file_state, manifest_digest, identity_level, last_scan_id]
+      properties:
+        artifact_id: {type: string}
+        root_id: {type: string}
+        relative_main: {type: string}
+        ordered_members:
+          type: array
+          items:
+            type: object
+            required: [name, role, size, sha256, file_id, mtime, header_digest]
+            properties:
+              name: {type: string}
+              role: {type: string}
+              size: {type: integer}
+              sha256: {type: string}
+              file_id: {type: string}
+              mtime: {type: integer}
+              header_digest: {type: string}
+        metadata: {type: object}
+        file_state: {type: string}
+        manifest_digest: {type: string}
+        identity_level: {type: string}
+        last_scan_id: {type: string}
+        projector_compatibility: {type: string, enum: [unverified], description: Content hashing is not fixed-engine semantic compatibility; unresolved projector association cannot execute or publish}
+    N1Evidence:
+      type: object
+      nullable: true
+      additionalProperties: false
+      required: [run_id, findings_seq, findings_digest, candidate_id]
+      properties:
+        run_id: {type: string}
+        findings_seq: {type: integer}
+        findings_digest: {type: string}
+        candidate_id: {type: string}
+    N1Recipe:
+      type: object
+      additionalProperties: false
+      required: [description, task_tags, artifact_id, artifact_manifest_digest, engine_identity, deployment, request, conclusion_level, evidence]
+      properties:
+        recipe_id: {type: string}
+        expected_version: {type: integer, minimum: 0}
+        description: {type: string, minLength: 1, maxLength: 4096}
+        task_tags: {type: array, maxItems: 32, items: {type: string, minLength: 1, maxLength: 128}}
+        artifact_id: {type: string}
+        artifact_manifest_digest: {type: string}
+        engine_identity: {type: string, maxLength: 256}
+        deployment: {$ref: '#/components/schemas/ControlPatch'}
+        request: {$ref: '#/components/schemas/N1RequestContract'}
+        conclusion_level: {type: string, enum: [unverified, synthetic_only, business_validated]}
+        evidence: {$ref: '#/components/schemas/N1Evidence'}
+        portable_members: {type: array, items: {type: string}, description: Portable root-relative names bound into the immutable recipe; not execution paths}
+        foreign: {type: boolean, readOnly: true}
+        source_ref: {type: string, readOnly: true}
+    N1RecipeView:
+      type: object
+      required: [recipe_id, version, recipe, recipe_digest, publication_state, effective_available]
+      properties:
+        recipe_id: {type: string}
+        version: {type: integer}
+        recipe: {$ref: '#/components/schemas/N1Recipe'}
+        recipe_digest: {type: string}
+        publication_state: {type: string, enum: [draft, published, withdrawn]}
+        effective_available: {type: boolean}
+    N1RecipeRecord:
+      type: object
+      required: [recipe_id, version, recipe, recipe_digest, publication_state, artifact_id, instance]
+      properties:
+        recipe_id: {type: string}
+        version: {type: integer}
+        recipe: {$ref: '#/components/schemas/N1Recipe'}
+        recipe_digest: {type: string}
+        publication_state: {type: string}
+        artifact_id: {type: string}
+        artifact_manifest_digest: {type: string}
+        instance: {type: string}
+        created_at: {type: integer, description: Unix milliseconds}
+    N1RecipeExport:
+      type: object
+      additionalProperties: false
+      required: [schema_version, recipe_id, version, recipe_digest, recipe]
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        recipe_id: {type: string}
+        version: {type: integer, minimum: 1}
+        recipe_digest: {type: string}
+        recipe: {$ref: '#/components/schemas/N1Recipe'}
+    N1Event:
+      type: object
+      required: [run_id, seq, event_type, payload, digest, created_at]
+      properties:
+        run_id: {type: string}
+        seq: {type: integer}
+        event_type: {type: string}
+        payload: {description: Immutable typed event payload; receipt/findings use schemas below}
+        digest: {type: string}
+        created_at: {type: integer}
+        event_key: {type: string}
+        analysis_version: {type: integer}
+    N1Run:
+      type: object
+      required: [run_id, kind, instance, boot_at_accept, idempotency_key, payload_digest, manifest, state, stage, deadline, budget, cleanup_state, terminal, findings_ref, findings_digest, analysis_state, frozen_at, created_at]
+      properties:
+        run_id: {type: string}
+        kind: {type: string, enum: [evaluation, switch, registration]}
+        instance: {type: string}
+        boot_at_accept: {type: string}
+        idempotency_key: {type: string}
+        payload_digest: {type: string}
+        manifest: {type: object}
+        state: {type: string}
+        stage: {type: string}
+        deadline: {type: integer, description: Unix milliseconds; not a guaranteed release time}
+        budget: {$ref: '#/components/schemas/N1Budget'}
+        cleanup_state: {type: string, enum: [pending, delegated_owner, released, failed, unknown]}
+        terminal: {type: object}
+        findings_ref: {type: integer, nullable: true}
+        findings_digest: {type: string, nullable: true}
+        analysis_state: {type: string, enum: [awaiting, finalized, not_available]}
+        frozen_at: {type: integer, nullable: true}
+        created_at: {type: integer}
+        events: {type: array, items: {$ref: '#/components/schemas/N1Event'}}
+        manifest_digest: {type: string}
+        attempt_receipt_set_digest: {type: string}
+        active_requests: {type: integer}
+        ready_token: {type: string}
+        use_id: {type: string}
+        recipe_id: {type: string}
+        recipe_version: {type: integer}
+        model: {type: string}
+        borrowed: {type: boolean}
+        request_contract: {$ref: '#/components/schemas/N1RequestContract'}
+        prompt_digest: {type: string}
+        identity: {$ref: '#/components/schemas/ControlSnapshot'}
+    N1Delivery:
+      type: object
+      additionalProperties: false
+      required: [dispatch, receipt, output_state]
+      properties:
+        dispatch: {$ref: '#/components/schemas/N1Event'}
+        receipt:
+          type: object
+          nullable: true
+          required: [attempt_id, candidate_id, state, quality, output_digest, output_bytes, generation, identity]
+          properties:
+            attempt_id: {type: integer}
+            candidate_id: {type: string}
+            state: {type: string}
+            quality: {type: string}
+            output_digest: {type: string}
+            output_bytes: {type: integer}
+            generation: {type: object, description: Real usage is nullable; truncated/empty/reasoning-only is unsuccessful}
+            identity: {$ref: '#/components/schemas/ControlSnapshot'}
+        output_state: {type: string, enum: [pending, available, retained, output_unavailable]}
+        body: {type: string, description: Private generated content, not logged; absent after lost default buffer}
+    N1Findings:
+      type: object
+      additionalProperties: false
+      required: [schema_version, run_id, analysis_version, idempotency_key, manifest_digest, attempt_receipt_set_digest, policy_version, evaluator_version, stop_reason, conclusion_level, candidates]
+      properties:
+        schema_version: {type: integer, enum: [1]}
+        run_id: {type: string}
+        analysis_version: {type: integer, minimum: 1}
+        idempotency_key: {type: string}
+        manifest_digest: {type: string}
+        attempt_receipt_set_digest: {type: string}
+        policy_version: {type: string}
+        evaluator_version: {type: string}
+        stop_reason: {type: string}
+        conclusion_level: {type: string, enum: [synthetic_only, business_validated, unverified]}
+        supersedes: {type: integer, nullable: true}
+        candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [candidate_id, artifact_manifest_digest, parameter_digest, tested_attempt_ids, quality_result, decision, reason, tested_range, untested_range, capacity_interval, limitations]
+            properties:
+              candidate_id: {type: string}
+              artifact_manifest_digest: {type: string}
+              parameter_digest: {type: string}
+              tested_attempt_ids: {type: array, items: {type: integer}}
+              quality_result: {type: string}
+              decision: {type: string}
+              reason: {type: string}
+              tested_range: {type: array, items: {type: integer}}
+              untested_range: {type: array, items: {type: integer}}
+              capacity_interval: {type: array, nullable: true, minItems: 2, maxItems: 2, items: {type: integer}}
+              limitations: {type: array, items: {type: string}}
     DeploymentCancelRequest:
       type: object
       additionalProperties: false

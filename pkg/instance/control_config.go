@@ -342,6 +342,8 @@ func (i *Instance) ControlCandidate(model string, patch map[string]json.RawMessa
 		}
 	}
 	opts.Control.Models[model] = m
+	opts.ActiveRecipe = nil
+	opts.DeploymentDigest = ""
 	opts.Control.Target = model
 	opts.PresetIni = nil
 	if err := opts.ValidateControlled(i.appConfig()); err != nil {

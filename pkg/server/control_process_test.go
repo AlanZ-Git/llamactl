@@ -39,6 +39,23 @@ func p3SyntheticEngine() int {
 	state := "unloaded"
 	loadSerial := 0
 	mode := os.Getenv("P3_SYNTHETIC_MODE")
+	modelIDs := []string{"alpha"}
+	if os.Getenv("N1_SYNTHETIC_MODELS") == "1" {
+		for idx, arg := range os.Args {
+			if arg == "--models-preset" && idx+1 < len(os.Args) {
+				data, err := os.ReadFile(os.Args[idx+1])
+				if err != nil {
+					return 82
+				}
+				modelIDs = nil
+				for _, line := range strings.Split(string(data), "\n") {
+					if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+						modelIDs = append(modelIDs, strings.TrimSuffix(strings.TrimPrefix(line, "["), "]"))
+					}
+				}
+			}
+		}
+	}
 	generations := 0
 	pause := func(r *http.Request, delay time.Duration) bool {
 		select {
@@ -53,9 +70,11 @@ func p3SyntheticEngine() int {
 		return 81
 	}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Ready-Token") != "" {
-			w.WriteHeader(500)
-			return
+		for _, key := range []string{"X-Ready-Token", "X-Service-Use", "X-Prompt-Template-Version", "X-Prompt-Digest", "X-Request-Timeout-Seconds", "X-Boot-ID", "X-Config-Revision", "X-Recipe-ID", "X-Recipe-Version"} {
+			if r.Header.Get(key) != "" {
+				w.WriteHeader(500)
+				return
+			}
 		}
 		if path := os.Getenv("P3_SYNTHETIC_EVENTS"); path != "" {
 			if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600); err == nil {
@@ -71,6 +90,15 @@ func p3SyntheticEngine() int {
 			}
 			io.WriteString(w, `{"status":"ok"}`)
 		case "/models/load":
+			// A test-owned marker makes a later load fail without changing artifact
+			// identity, publication evidence or running a real engine/parser.
+			if path := os.Getenv("N1_SYNTHETIC_LOAD_FAILURE_FILE"); path != "" {
+				if _, err := os.Stat(path); err == nil {
+					w.WriteHeader(500)
+					io.WriteString(w, "private/path secret-backend-body")
+					return
+				}
+			}
 			var b struct {
 				Model string `json:"model"`
 			}
@@ -120,16 +148,34 @@ func p3SyntheticEngine() int {
 				return
 			}
 			mu.Lock()
-			s := state
+			s, loadedModel := state, model
 			mu.Unlock()
-			fmt.Fprintf(w, `{"data":[{"id":"alpha","status":{"value":%q}}]}`, s)
+			entries := []map[string]any{}
+			for _, id := range modelIDs {
+				value := "unloaded"
+				if id == loadedModel {
+					value = s
+				}
+				entries = append(entries, map[string]any{"id": id, "status": map[string]string{"value": value}})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": entries})
 		case "/props":
-			if r.URL.Query().Get("model") != "alpha" || r.URL.Query().Get("autoload") != "false" {
+			validModel := false
+			for _, id := range modelIDs {
+				validModel = validModel || r.URL.Query().Get("model") == id
+			}
+			if !validModel || r.URL.Query().Get("autoload") != "false" {
 				w.WriteHeader(400)
 				return
 			}
 			io.WriteString(w, `{"default_generation_settings":{}}`)
 		case "/v1/chat/completions", "/completion":
+			if os.Getenv("N1_SYNTHETIC_MODELS") == "1" {
+				for _, key := range []string{"X-Recipe-ID", "X-Recipe-Version", "X-Boot-ID", "X-Config-Revision", "X-Process-Generation", "X-Load-Generation", "X-Prompt-Template-Version", "X-Prompt-Digest"} {
+					w.Header().Add(key, "synthetic-backend-spoof")
+					w.Header().Add(key, "second-spoof")
+				}
+			}
 			var b struct {
 				Model         string   `json:"model"`
 				Stream        bool     `json:"stream"`
@@ -197,7 +243,7 @@ func p3SyntheticEngine() int {
 				}
 				io.WriteString(w, "data: [DONE]\n\n")
 			} else {
-				io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"synthetic"}}]}`)
+				_ = json.NewEncoder(w).Encode(map[string]any{"model": b.Model, "choices": []any{map[string]any{"message": map[string]string{"role": "assistant", "content": "synthetic"}, "finish_reason": "stop"}}})
 			}
 		default:
 			w.WriteHeader(404)

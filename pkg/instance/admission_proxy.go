@@ -89,7 +89,14 @@ func (i *Instance) ReserveProxyRequest(w http.ResponseWriter, r *http.Request) (
 	return func() { cleanup(); permit.Close() }, nil
 }
 
-func (i *Instance) PrepareInferenceRequest(r *http.Request) (func(), error) {
+func (i *Instance) PrepareInferenceRequest(r *http.Request, writers ...http.ResponseWriter) (func(), error) {
+	var w http.ResponseWriter
+	if len(writers) != 0 {
+		w = writers[0]
+	}
+	if release, handled, err := i.acquireServiceRequest(w, r, true); handled {
+		return release, err
+	}
 	permit, err := i.policy.Acquire()
 	if err != nil {
 		return nil, err
@@ -257,6 +264,15 @@ func (i *Instance) serveAdmitted(w http.ResponseWriter, r *http.Request) (err er
 		}
 	}()
 	access := classifyProxy(r)
+	if access == proxyUse {
+		if release, handled, serviceErr := i.acquireServiceRequest(w, r, false); handled {
+			if serviceErr != nil {
+				return serviceErr
+			}
+			defer release()
+			return i.forwardHTTP(w, r)
+		}
+	}
 	var permit *resourcepolicy.Permit
 	if access != proxyRead && !(access == proxyMaintenance && r.URL.Path == "/models/unload") {
 		if prior, ok := r.Context().Value(policyContextKey{}).(*resourcepolicy.Permit); ok {

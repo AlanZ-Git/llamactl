@@ -1,5 +1,10 @@
 # Quick Start
 
+> This upstream guide is for administrator setup of ordinary instances. For this fork's
+> controlled Router clients, start with [客户端接入与使用](client-integration.zh-CN.md).
+> Do not disable authentication or use native start/PUT/load on a protocol-controlled
+> instance; optional N1 support depends on the deployed version, configuration and capabilities.
+
 This guide will help you get Llamactl up and running in just a few minutes.
 
 **Before you begin:** Ensure you have at least one backend installed (llama.cpp, MLX, or vLLM). See the [Installation Guide](installation.md#prerequisites) for backend setup.

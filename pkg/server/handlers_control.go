@@ -60,11 +60,13 @@ func writeControlError(w http.ResponseWriter, err error) {
 		status, code = 500, "control_failed"
 	}
 	switch code {
-	case "instance_not_found", "operation_not_found", "control_not_enabled", "test_unknown_not_resumable":
+	case "administrator_required":
+		status = 403
+	case "instance_not_found", "operation_not_found", "control_not_enabled", "test_unknown_not_resumable", "n1_not_found":
 		status = 404
-	case "invalid_config", "unsupported_parameter", "invalid_deadline", "invalid_test_budget":
+	case "invalid_config", "unsupported_parameter", "invalid_deadline", "invalid_test_budget", "parameter_range_mismatch", "invalid_findings", "invalid_quality_claim", "candidate_coverage_mismatch", "receipt_coverage_mismatch", "invalid_attempt_reference":
 		status = 422
-	case "operation_capacity":
+	case "operation_capacity", "mapping_capacity":
 		status = 429
 	}
 	writeError(w, status, code, code)

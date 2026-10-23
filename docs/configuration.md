@@ -8,6 +8,12 @@ Defaults < .env file < Configuration file (with env var expansion) < LLAMACTL_* 
 
 llamactl works out of the box with sensible defaults, but you can customize the behavior to suit your needs.
 
+The examples below describe general configuration, not a safe new-workstation deployment profile.
+For explicit loopback binding, independent absolute state/cache paths, configured owner credentials and optional N1,
+use the [workstation guide](workstation-deployment.zh-CN.md#local-config).
+Controlled instances do not inherit ordinary autostart/eviction behavior. Use absolute paths for deployment:
+do not assume `~` expansion or that every explicitly supplied relative path is rebased under `data_dir`.
+
 ## Default Configuration
 
 Here's the default configuration with all available options:
@@ -53,7 +59,7 @@ data_dir: ~/.local/share/llamactl  # Main data directory (database, instances, l
 
 instances:
   port_range: [8000, 9000]         # Port range for instances
-  configs_dir: data_dir/instances  # Instance configs directory
+  instances_dir: data_dir/instances  # Instance working directories (derived presets)
   logs_dir: data_dir/logs          # Logs directory
   auto_create_dirs: true           # Auto-create data/config/logs dirs if missing
   max_instances: -1                # Max instances (-1 = unlimited)
@@ -267,7 +273,7 @@ data_dir: "~/.local/share/llamactl"  # Main data directory for database, instanc
 ```yaml
 instances:
   port_range: [8000, 9000]      # Port range for instances (default: [8000, 9000])
-  configs_dir: "instances"      # Directory for instance configs, default: data_dir/instances
+  instances_dir: "<absolute-instance-directory>" # Default when empty: data_dir/instances
   logs_dir: "logs"              # Directory for instance logs, default: data_dir/logs
   auto_create_dirs: true        # Automatically create data/config/logs directories (default: true)
   max_instances: -1             # Maximum instances (-1 = unlimited)

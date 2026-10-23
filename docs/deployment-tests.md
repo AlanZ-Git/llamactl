@@ -228,7 +228,7 @@ an active run is a snapshot, not a final result.
 
 ## Standard-library client example
 
-[`examples/deployment_test.py`](../examples/deployment_test.py) reuses the existing
+`examples/deployment_test.py` (path relative to the repository root) reuses the existing
 control client's authentication and redirect protections. It does not issue
 credentials, recover a boot, resume owner policy, or retry generations. Supply an
 already-authorized credential via your normal secret storage (not in the URL):

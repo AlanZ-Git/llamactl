@@ -49,6 +49,15 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - 工作站部署（中文）: workstation-deployment.zh-CN.md
+  - 客户端接入（中文）:
+      - 接入与使用: client-integration.zh-CN.md
+      - 有限控制与 N1: control-api.zh-CN.md
+      - OpenAPI YAML: control-openapi.yaml
+      - 资源观测: resources.md
+      - 主人暂停与释放: resource-policy.md
+      - 单配置测试: deployment-tests.md
+      - N1 客户端与外部评测: evaluator-client.md
   - Installation: installation.md
   - Quick Start: quick-start.md
   - Configuration: configuration.md

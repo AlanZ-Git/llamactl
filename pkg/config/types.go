@@ -36,6 +36,8 @@ type BackendConfig struct {
 
 // AppConfig represents the configuration for llamactl
 type AppConfig struct {
+	N1     N1Config         `yaml:"n1,omitempty" json:"-"`
+	N1Lane *AdmissionDomain `yaml:"-" json:"-" swaggerignore:"true"`
 	// ResourcePolicy is initialized by manager.New before loading instances.
 	ResourcePolicy *resourcepolicy.Gate  `yaml:"-" json:"-" swaggerignore:"true"`
 	Server         ServerConfig          `yaml:"server" json:"server"`

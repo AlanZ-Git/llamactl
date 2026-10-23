@@ -44,17 +44,19 @@ type admissionGate struct {
 	maintenance map[*Maintenance]struct{}
 	retired     bool
 	transition  bool
+	reservation *Reservation
 }
 
 // Maintenance is a checked, instance-bound capability. It holds no gate mutex
 // during IO. Close invalidates every operation and prepared candidate using it.
 // The private operation mutex prevents concurrent reuse or close of a capability.
 type Maintenance struct {
-	mu       sync.Mutex
-	instance *Instance
-	closed   bool
-	permit   *resourcepolicy.Permit
-	protocol bool
+	mu          sync.Mutex
+	instance    *Instance
+	closed      bool
+	permit      *resourcepolicy.Permit
+	protocol    bool
+	laneRelease func()
 }
 
 // BeginWorkMaintenance checks the owner latch before ordinary instance contention.
@@ -85,23 +87,40 @@ func (i *Instance) beginMaintenance(work bool) (*Maintenance, error) {
 }
 
 func (i *Instance) beginMaintenanceInternal(work bool) (*Maintenance, error) {
+	return i.beginReservedMaintenance(work, nil)
+}
+
+func (i *Instance) beginReservedMaintenance(work bool, reservation *Reservation) (*Maintenance, error) {
 	permit, err := i.policy.Acquire()
 	if err != nil && work {
 		return nil, err
+	}
+	laneRelease := func() {}
+	if reservation == nil {
+		var ok bool
+		laneRelease, ok = i.lane.Enter()
+		if !ok {
+			permit.Close()
+			return nil, BusyError()
+		}
 	}
 	accepted := false
 	defer func() {
 		if !accepted {
 			permit.Close()
+			laneRelease()
 		}
 	}()
 	i.admission.mu.Lock()
 	defer i.admission.mu.Unlock()
+	if i.admission.reservation != reservation || (reservation != nil && work && reservation.closing) {
+		return nil, BusyError()
+	}
 	if i.admission.retired || i.admission.transition ||
 		(i.IsControlled() && (len(i.admission.maintenance) != 0 || i.admission.uses != 0)) {
 		return nil, BusyError()
 	}
-	m := &Maintenance{instance: i, permit: permit}
+	m := &Maintenance{instance: i, permit: permit, laneRelease: laneRelease}
 	accepted = true
 	if i.admission.maintenance == nil {
 		i.admission.maintenance = make(map[*Maintenance]struct{})
@@ -135,6 +154,9 @@ func (m *Maintenance) Close() {
 	}
 	i := m.instance
 	defer m.permit.Close()
+	if m.laneRelease != nil {
+		defer m.laneRelease()
+	}
 	i.admission.mu.Lock()
 	defer i.admission.mu.Unlock()
 	if _, active := i.admission.maintenance[m]; !active {
@@ -270,18 +292,24 @@ func (i *Instance) AcquireAutomaticUse() (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	laneRelease, ok := i.lane.Enter()
+	if !ok {
+		permit.Close()
+		return nil, BusyError()
+	}
 	release, err := i.acquireAutomaticInstanceUse()
 	if err != nil {
+		laneRelease()
 		permit.Close()
 		return nil, err
 	}
-	return func() { release(); permit.Close() }, nil
+	return func() { release(); permit.Close(); laneRelease() }, nil
 }
 
 func (i *Instance) acquireAutomaticInstanceUse() (func(), error) {
 	i.admission.mu.Lock()
 	defer i.admission.mu.Unlock()
-	if i.admission.retired || i.admission.transition {
+	if i.admission.retired || i.admission.transition || i.admission.reservation != nil {
 		return nil, BusyError()
 	}
 	if i.IsControlled() {
@@ -304,19 +332,29 @@ func (i *Instance) acquireUse(readOnly bool) (func(), bool, error) {
 			return nil, i.IsControlled(), err
 		}
 	}
+	laneRelease := func() {}
+	if !readOnly {
+		var ok bool
+		laneRelease, ok = i.lane.Enter()
+		if !ok {
+			permit.Close()
+			return nil, i.IsControlled(), BusyError()
+		}
+	}
 	release, controlled, err := i.acquireInstanceUse(readOnly)
 	if err != nil {
+		laneRelease()
 		permit.Close()
 		return nil, controlled, err
 	}
-	return func() { release(); permit.Close() }, controlled, nil
+	return func() { release(); permit.Close(); laneRelease() }, controlled, nil
 }
 
 func (i *Instance) acquireInstanceUse(readOnly bool) (func(), bool, error) {
 	i.admission.mu.Lock()
 	defer i.admission.mu.Unlock()
 	controlled := i.IsControlled()
-	if i.admission.retired || i.admission.transition {
+	if i.admission.retired || i.admission.transition || i.admission.reservation != nil {
 		return nil, controlled, BusyError()
 	}
 	if controlled {

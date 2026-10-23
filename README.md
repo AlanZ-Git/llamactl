@@ -6,6 +6,25 @@
 
 📚 **[Full Documentation →](https://llamactl.org)**
 
+## 定制版阅读入口（中文）
+
+本 fork 复用官方推理后端，提供模型/实例管理、有限参数应用与就绪确认、主人暂停与归属释放、
+CPU/RAM/GPU/VRAM 观测，以及单配置有界测试和可选 N1 模型目录、持久评测/recipe、直接服务使用。
+控制/N1 当前面向一个本机原生 llama.cpp Router，不是通用调度器或业务评分系统。
+上游仍有 remote-node 管理能力；这不等于本机定制协议支持跨节点调度或统一 GPU 池。
+
+- 新工作站：[Windows/Linux 部署指南](docs/workstation-deployment.zh-CN.md)（固定源码、CGO/WebUI、独立状态与鉴权、本机到内网验证）。
+- 调用现有服务：[客户端接入与使用](docs/client-integration.zh-CN.md)。
+- 开发与维护：[CONTRIBUTING.md](CONTRIBUTING.md)；Agent 首读 [AGENTS.md](AGENTS.md)。
+
+从[客户端接入与使用](docs/client-integration.zh-CN.md)开始：区分上游通用 API、
+有限控制 `p3a/1` 与可选 N1 扩展；源码/合成验证不等于目标环境已部署或业务质量通过。
+契约见[有限控制与 N1](docs/control-api.zh-CN.md)、[OpenAPI](docs/control-openapi.yaml)；
+另见[资源观测](docs/resources.md)、[主人暂停与释放](docs/resource-policy.md)、
+[单配置测试](docs/deployment-tests.md)及[N1 客户端/评测工具](tools/evaluator/README.md)。
+以下为上游功能与部署说明；受控实例不要照普通 Quick Start 用旧 UI/原生接口启动、改配置或自动加载。
+本地文档链接不表示定制文档已发布到上游网站。
+
 ![Dashboard Screenshot](docs/images/dashboard.png)
 
 ## Features
@@ -93,6 +112,9 @@ backends:
 
 ### Option 1: Download Binary (Recommended)
 
+以下下载/镜像来自上游，不保证包含本 fork 的 control/N1 定制；定制部署请用上方工作站指南，
+核维护者指定的完整提交/候选清单和产物摘要，不从上游 latest 推定定制产物已发布。
+
 ```bash
 # Linux/macOS - Get latest version and download
 LATEST_VERSION=$(curl -s https://api.github.com/repos/lordmathis/llamactl/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
@@ -126,12 +148,13 @@ docker build -f docker/Dockerfile.source -t llamactl:source .
 **Note:** Dockerfiles are configured for CUDA. Adapt base images for other platforms (CPU, ROCm, etc.).
 
 ### Option 3: Build from Source
-Requires Go 1.24+ and Node.js 22+
+Requires Go 1.26 (see go.mod), Node.js 22.12+ and a target C compiler with CGO enabled for SQLite.
+The clone below is upstream; for this fork use the maintainer-provided fixed source instead.
 ```bash
 git clone https://github.com/lordmathis/llamactl.git
 cd llamactl
 cd webui && npm ci && npm run build && cd ..
-go build -o llamactl ./cmd/server
+CGO_ENABLED=1 go build -o llamactl ./cmd/server
 ```
 
 ## Usage
@@ -143,6 +166,10 @@ go build -o llamactl ./cmd/server
 5. Start the instance and use it with any OpenAI-compatible client
 
 ## Configuration
+
+下面保留上游通用配置示例（含通配监听/CORS）。新工作站请先用
+[loopback 与独立状态配置](docs/workstation-deployment.zh-CN.md#local-config)，
+不要将这些默认值直接当内网部署方案；受控实例也不使用普通实例的自动加载/驱逐流程。
 
 llamactl works out of the box with sensible defaults. Configuration is loaded with the following precedence:
 
@@ -219,7 +246,7 @@ auth:
   management_keys: []            # Keys for management endpoints
 ```
 
-For detailed configuration options including environment variables, file locations, and advanced settings, see the [Configuration Guide](docs/getting-started/configuration.md).
+For detailed configuration options including environment variables, file locations, and advanced settings, see the [Configuration Guide](docs/configuration.md).
 
 ## License
 

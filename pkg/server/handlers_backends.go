@@ -71,7 +71,7 @@ func (h *Handler) LlamaCppUIProxy() http.HandlerFunc {
 		}
 
 		// Use instance's ServeHTTP which tracks inflight requests and handles shutting down state
-		err = inst.ServeHTTP(w, r)
+		err = h.serveN1Aware(inst, w, r)
 		if err != nil {
 			// Error is already handled in ServeHTTP (response written)
 			return
@@ -137,7 +137,7 @@ func (h *Handler) LlamaCppProxy() http.HandlerFunc {
 		}
 
 		// Use instance's ServeHTTP which tracks inflight requests and handles shutting down state
-		err = inst.ServeHTTP(w, r)
+		err = h.serveN1Aware(inst, w, r)
 		if err != nil {
 			// Error is already handled in ServeHTTP (response written)
 			return
@@ -341,7 +341,7 @@ func (h *Handler) LlamaCppListModels() http.HandlerFunc {
 		r.URL.Path = "/models"
 
 		// Use instance's ServeHTTP which tracks inflight requests and handles shutting down state
-		err = inst.ServeHTTP(w, r)
+		err = h.serveN1Aware(inst, w, r)
 		if err != nil {
 			// Error is already handled in ServeHTTP (response written)
 			return
@@ -396,7 +396,7 @@ func (h *Handler) LlamaCppLoadModel() http.HandlerFunc {
 		}
 
 		// Use instance's ServeHTTP which tracks inflight requests and handles shutting down state
-		err = inst.ServeHTTP(w, r)
+		err = h.serveN1Aware(inst, w, r)
 		if err != nil {
 			// Error is already handled in ServeHTTP (response written)
 			return
@@ -436,7 +436,7 @@ func (h *Handler) LlamaCppUnloadModel() http.HandlerFunc {
 		r.URL.Path = "/models/unload"
 
 		// Use instance's ServeHTTP which tracks inflight requests and handles shutting down state
-		err = inst.ServeHTTP(w, r)
+		err = h.serveN1Aware(inst, w, r)
 		if err != nil {
 			// Error is already handled in ServeHTTP (response written)
 			return

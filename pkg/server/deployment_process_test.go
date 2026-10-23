@@ -32,6 +32,7 @@ type deploymentFixture struct {
 	cfg      *config.AppConfig
 	events   string
 	contract controlAPIDoc
+	n1Store  *database.N1Store
 }
 
 // Extends the P3 controlled child helper: actual SQLite, manager, Router process,

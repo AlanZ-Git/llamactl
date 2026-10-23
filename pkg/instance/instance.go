@@ -28,6 +28,7 @@ type Instance struct {
 	admission admissionGate
 	control   controlRuntime // protected by admission.mu, not a second admission gate
 	policy    *resourcepolicy.Gate
+	lane      *config.AdmissionDomain
 
 	status  *status  `json:"-"`
 	options *options `json:"-"`
@@ -114,6 +115,7 @@ func newChecked(name string, globalConfig *config.AppConfig, opts *Options, onSt
 	// Only create logger, proxy, and process for local instances
 	if !instance.IsRemote() {
 		instance.policy = globalConfig.ResourcePolicy
+		instance.lane = globalConfig.N1Lane
 		var permit *resourcepolicy.Permit
 		if prepare {
 			permit, err = instance.policy.Acquire()

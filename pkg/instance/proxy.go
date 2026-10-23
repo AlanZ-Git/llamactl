@@ -139,6 +139,13 @@ func (p *proxy) build() (*httputil.ReverseProxy, error) {
 		originalDirector(req)
 		// Manager readiness capabilities never belong to an engine or remote node.
 		req.Header.Del("X-Ready-Token")
+		req.Header.Del("X-Service-Use")
+		req.Header.Del("X-Request-Timeout-Seconds")
+		req.Header.Del("X-Prompt-Template-Version")
+		req.Header.Del("X-Prompt-Digest")
+		for _, key := range []string{"X-Recipe-ID", "X-Recipe-Version", "X-Boot-ID", "X-Config-Revision", "X-Process-Generation", "X-Load-Generation"} {
+			req.Header.Del(key)
+		}
 
 		// Add API key header for remote instances
 		if key != "" {
@@ -165,6 +172,11 @@ func (p *proxy) build() (*httputil.ReverseProxy, error) {
 
 			for key, value := range current.responseHeaders {
 				resp.Header.Set(key, value)
+			}
+			if identity, ok := resp.Request.Context().Value(serviceIdentityKey{}).(map[string]string); ok {
+				for key, value := range identity {
+					resp.Header.Set(key, value)
+				}
 			}
 			return nil
 		}

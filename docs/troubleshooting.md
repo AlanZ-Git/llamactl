@@ -2,6 +2,10 @@
 
 Issues specific to Llamactl deployment and operation.
 
+For the fork's independent state, controlled/N1 initialization and upgrade/restore boundaries,
+start with the [workstation guide](workstation-deployment.zh-CN.md#lifecycle-troubleshooting).
+Starting a backend directly is a real workload, not a read-only diagnostic; do it only with authorization and isolated ownership.
+
 ## Configuration Issues
 
 ### Invalid Configuration
@@ -12,7 +16,7 @@ Issues specific to Llamactl deployment and operation.
 1. Use minimal configuration:
    ```yaml
    server:
-     host: "0.0.0.0"
+     host: "127.0.0.1"
      port: 8080
    instances:
      port_range: [8000, 9000]
@@ -108,12 +112,9 @@ vllm serve microsoft/DialoGPT-medium --port 8081
 **Problem:** API requests failing with authentication errors
 
 **Solutions:**
-1. **Disable authentication temporarily:**
-   ```yaml
-   auth:
-     require_management_auth: false
-     require_inference_auth: false
-   ```
+1. **Keep authentication enabled.** Verify the target origin/port and whether the endpoint needs a management,
+   inference, scoped-controller or N1 capability-bearing key. Check expiry, instance scope and the error code;
+   do not fix 401/403 by disabling authentication, using a full-power key, or allowing every origin.
 
 2. **Configure management API keys:**
    ```yaml
@@ -129,6 +130,10 @@ vllm serve microsoft/DialoGPT-medium --port 8081
    curl -H "Authorization: Bearer your-api-key" \
      http://localhost:8080/api/v1/instances
    ```
+
+   Inject the real credential through approved secure storage, not source or shell history.
+   For controlled/N1 paths also check current boot/revision, ready/service-use identity, owner pause and recovery.
+   See [client fault handling](client-integration.zh-CN.md#client-faults); stale state is not repaired by automatic replay.
 
 ## Remote Node Issues
 

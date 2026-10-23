@@ -2,6 +2,11 @@
 
 Learn how to effectively manage your llama.cpp, MLX, and vLLM instances with Llamactl through both the Web UI and API.
 
+This page's edit/start/stop/autostart instructions are for ordinary instances. For protocol-enabled controlled instances,
+use [workstation initialization](workstation-deployment.zh-CN.md#instance-setup) and
+[control/N1 operations](client-integration.zh-CN.md), not the legacy UI lifecycle buttons or raw Router load/unload.
+Merely setting `controlled=true` enables the [admission foundation](controlled-admission.md), not the full protocol.
+
 ## Overview
 
 Llamactl provides two ways to manage instances:

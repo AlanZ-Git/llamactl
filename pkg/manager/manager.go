@@ -50,6 +50,8 @@ type instanceManager struct {
 	controlOnce   sync.Once
 	control       *controlLedger
 	resources     *resources.Sampler
+	n1Once        sync.Once
+	n1            *n1Coordinator
 }
 
 // New creates a new instance of InstanceManager with dependency injection.
@@ -62,6 +64,9 @@ func New(globalConfig *config.AppConfig, db database.InstanceStore) InstanceMana
 		log.Printf("Owner policy blocked: %v", err)
 	}
 	globalConfig.ResourcePolicy = policy
+	if globalConfig.N1.Instance != "" {
+		globalConfig.N1Lane = &config.AdmissionDomain{}
+	}
 
 	if globalConfig.Instances.TimeoutCheckInterval <= 0 {
 		globalConfig.Instances.TimeoutCheckInterval = 5 // Default to 5 minutes if not set
@@ -104,6 +109,7 @@ func New(globalConfig *config.AppConfig, db database.InstanceStore) InstanceMana
 	collector := resources.NewCollector(im.collectOwnedResources)
 	im.resources = resources.NewSampler(collector.Collect, im.resourcesIdle)
 	im.resources.Start()
+	im.initN1()
 
 	return im
 }
@@ -115,6 +121,7 @@ func (im *instanceManager) persistInstance(inst *instance.Instance) error {
 
 func (im *instanceManager) Shutdown() {
 	im.shutdownOnce.Do(func() {
+		im.shutdownN1()
 		if im.resources != nil {
 			im.resources.Stop()
 		}

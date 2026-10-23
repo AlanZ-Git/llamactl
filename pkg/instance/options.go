@@ -17,8 +17,10 @@ type Options struct {
 	// Controlled opts into atomic use/maintenance admission; absent/false is legacy.
 	Controlled bool `json:"controlled,omitempty"`
 	// Control enables the finite Router protocol; mappings are local administrator data.
-	Control        *ControlConfig `json:"control,omitempty"`
-	ConfigRevision uint64         `json:"config_revision,omitempty"`
+	Control          *ControlConfig `json:"control,omitempty"`
+	ConfigRevision   uint64         `json:"config_revision,omitempty"`
+	ActiveRecipe     *RecipeRef     `json:"active_recipe_ref,omitempty"`
+	DeploymentDigest string         `json:"deployment_digest,omitempty"`
 	// Auto restart
 	AutoRestart  *bool `json:"auto_restart,omitempty"`
 	MaxRestarts  *int  `json:"max_restarts,omitempty"`

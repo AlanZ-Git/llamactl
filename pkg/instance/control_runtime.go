@@ -164,10 +164,14 @@ func (i *Instance) readyCurrentLocked() bool {
 // BeginControl obtains the SAME maintenance gate as native lifecycle and proxy
 // use. The caller serializes its ledger separately, but that ledger grants no use.
 func (i *Instance) BeginControl(boot string, revision uint64, work, recovery bool) (*Maintenance, error) {
+	return i.beginN1Control(boot, revision, work, recovery, nil)
+}
+
+func (i *Instance) beginN1Control(boot string, revision uint64, work, recovery bool, reservation *Reservation) (*Maintenance, error) {
 	if !i.ProtocolEnabled() {
 		return nil, controlError("control_not_enabled")
 	}
-	m, err := i.beginMaintenanceInternal(work)
+	m, err := i.beginReservedMaintenance(work, reservation)
 	if err != nil {
 		return nil, err
 	}

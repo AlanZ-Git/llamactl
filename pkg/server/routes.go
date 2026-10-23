@@ -45,6 +45,14 @@ func SetupRouter(handler *Handler) *chi.Mux {
 
 	// Define routes
 	r.Route("/api/v1", func(r chi.Router) {
+		for _, resource := range []string{"inventory", "recipes", "evaluation-runs", "service-uses", "observation"} {
+			base := "/instances/{name}/" + resource
+			r.Get(base, handler.N1Handler())
+			r.Post(base, httpreject.Handler(handler.N1Handler()))
+			r.Get(base+"/*", handler.N1Handler())
+			r.Post(base+"/*", httpreject.Handler(handler.N1Handler()))
+		}
+		r.Put("/instances/{name}/capabilities/{key_id}", httpreject.Handler(handler.N1Handler()))
 		r.Get("/instances/{name}/control", handler.ControlHandler())
 		r.Put("/instances/{name}/control", httpreject.Handler(handler.ControlHandler()))
 		r.Post("/instances/{name}/operations", httpreject.Handler(handler.ControlHandler()))
